@@ -126,12 +126,14 @@ async function placeOrder({ tokenId, price, size, side, apiKey, apiSecret, apiPa
     return { status: "paper", message: "Paper trade (connect wallet for live execution)" };
   }
   try {
-    const wallet = new Wallet(privateKey);
+    // ethers v6 renamed _signTypedData → signTypedData; clob-client checks for the v5 name
+    const _w = new Wallet(privateKey);
+    const signer = { _signTypedData: _w.signTypedData.bind(_w), getAddress: _w.getAddress.bind(_w) };
     const sigType = funderAddress ? SignatureType.POLY_PROXY : SignatureType.EOA;
     const client = new ClobClient(
       "https://clob.polymarket.com",
       137, // Polygon mainnet
-      wallet,
+      signer,
       { key: apiKey, secret: apiSecret, passphrase: apiPassphrase },
       sigType,
       funderAddress || undefined
@@ -1051,12 +1053,13 @@ export default function App() {
     setKeyGenLoading(true);
     setKeyGenStatus(null);
     try {
-      const wallet = new Wallet(privateKey.trim());
+      const _w = new Wallet(privateKey.trim());
+      const signer = { _signTypedData: _w.signTypedData.bind(_w), getAddress: _w.getAddress.bind(_w) };
       const sigType = funderAddress ? SignatureType.POLY_PROXY : SignatureType.EOA;
       const client = new ClobClient(
         "https://clob.polymarket.com",
         137,
-        wallet,
+        signer,
         undefined, // no creds needed — L1 auth uses the wallet directly
         sigType,
         funderAddress || undefined
