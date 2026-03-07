@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function fmt(n, d = 2) { return isNaN(n) ? "0.00" : Number(n).toFixed(d); }
@@ -621,6 +621,10 @@ export default function App() {
   const tradeCountRef = useRef(0);
   const winCountRef = useRef(0);
 
+  // ── Profit history for time-windowed P&L tracking ──────────────────────────
+  const pnlHistory = useRef([]); // Array of { ts: Date.now(), pnl: number }
+  const [profitWindow, setProfitWindow] = useState("30m"); // "30m" | "1h" | "1d"
+
   // ── Fetch live markets from Polymarket Gamma API ───────────────────────────
   const [dataSource, setDataSource] = useState("loading");
 
@@ -847,6 +851,7 @@ export default function App() {
         } : t));
         setTradeMarkers(prev => prev.map(m => m.id === tradeId ? { ...m, pnl: rawPnl } : m));
         setTotalPnl(p => p + rawPnl);
+        pnlHistory.current.push({ ts: Date.now(), pnl: rawPnl });
 
         setBalance(prev => {
           const nb = prev + rawPnl;
@@ -995,6 +1000,27 @@ export default function App() {
   const winRate = tradeCount > 0 ? Math.round((winCount / tradeCount) * 100) : 0;
   const lastPrice = candles[candles.length - 1]?.close || 50;
   const filteredMarkets = markets.filter(m => !marketSearch || m.question?.toLowerCase().includes(marketSearch.toLowerCase()));
+
+  // ── Time-windowed profit calculations ─────────────────────────────────────
+  // Re-trigger calculation whenever tradeCount changes (new trade closed) or profitWindow changes
+  const [profitTick, setProfitTick] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setProfitTick(t => t + 1), 5000); // refresh every 5s
+    return () => clearInterval(iv);
+  }, []);
+
+  const windowProfits = useMemo(() => {
+    const now = Date.now();
+    const windows = { "30m": 30 * 60 * 1000, "1h": 60 * 60 * 1000, "1d": 24 * 60 * 60 * 1000 };
+    const result = {};
+    for (const [key, ms] of Object.entries(windows)) {
+      const cutoff = now - ms;
+      const inWindow = pnlHistory.current.filter(r => r.ts >= cutoff);
+      result[key] = { pnl: inWindow.reduce((s, r) => s + r.pnl, 0), trades: inWindow.length };
+    }
+    return result;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tradeCount, profitTick, profitWindow]);
 
   return (
     <div style={{ minHeight: "100vh", background: "#080808", color: "#fff", fontFamily: "'DM Sans', -apple-system, sans-serif" }}>
@@ -1509,6 +1535,71 @@ export default function App() {
               </Card>
 
             </div>
+
+            {/* ── Profit Tracker Bubble ── */}
+            <Card glow={anyOn && windowProfits[profitWindow]?.pnl > 0 ? "#00c805" : undefined}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span style={{ fontSize: "18px" }}>💰</span>
+                  <div>
+                    <div style={{ fontWeight: 800, fontSize: "15px" }}>Profit Tracker</div>
+                    <div style={{ fontSize: "11px", color: "#bbb" }}>Earnings by time window</div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: "4px", background: "#111", padding: "3px", borderRadius: "100px", border: "1px solid #1e1e1e" }}>
+                  {[["30m", "30 Min"], ["1h", "1 Hour"], ["1d", "1 Day"]].map(([key, label]) => (
+                    <button key={key} onClick={() => setProfitWindow(key)} style={{
+                      padding: "4px 14px", borderRadius: "100px",
+                      background: profitWindow === key ? "#00c805" : "transparent",
+                      color: profitWindow === key ? "#000" : "#777",
+                      border: "none", fontFamily: "inherit", fontWeight: 700, fontSize: "11px",
+                      cursor: "pointer", transition: "all 0.18s"
+                    }}>{label}</button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px" }}>
+                {[["30m", "30 Min"], ["1h", "1 Hour"], ["1d", "24 Hours"]].map(([key, label]) => {
+                  const data = windowProfits[key] || { pnl: 0, trades: 0 };
+                  const isActive = profitWindow === key;
+                  const col = data.pnl > 0 ? "#00c805" : data.pnl < 0 ? "#ff5000" : "#555";
+                  return (
+                    <div key={key} onClick={() => setProfitWindow(key)} style={{
+                      background: isActive ? `${col}10` : "#0d0d0d",
+                      border: `1.5px solid ${isActive ? `${col}44` : "#1a1a1a"}`,
+                      borderRadius: "14px", padding: "16px 14px", textAlign: "center",
+                      cursor: "pointer", transition: "all 0.2s",
+                      boxShadow: isActive && data.pnl !== 0 ? `0 0 20px ${col}22` : "none"
+                    }}>
+                      <div style={{ fontSize: "9px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "6px" }}>{label.toUpperCase()}</div>
+                      <div style={{ fontSize: "26px", fontWeight: 800, color: col, lineHeight: 1, letterSpacing: "-0.03em" }}>
+                        {data.pnl >= 0 ? "+" : "-"}${fmt(Math.abs(data.pnl))}
+                      </div>
+                      <div style={{ fontSize: "10px", color: "#666", marginTop: "6px" }}>{data.trades} trade{data.trades !== 1 ? "s" : ""}</div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Active window detail bar */}
+              {(() => {
+                const data = windowProfits[profitWindow] || { pnl: 0, trades: 0 };
+                const col = data.pnl > 0 ? "#00c805" : data.pnl < 0 ? "#ff5000" : "#555";
+                const windowLabel = { "30m": "30 minutes", "1h": "1 hour", "1d": "24 hours" }[profitWindow];
+                return (
+                  <div style={{ marginTop: "12px", padding: "10px 14px", background: `${col}08`, border: `1px solid ${col}22`, borderRadius: "10px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ fontSize: "11px", color: "#bbb" }}>
+                      {data.trades === 0
+                        ? `No trades in the last ${windowLabel}`
+                        : `${data.trades} trade${data.trades !== 1 ? "s" : ""} closed in the last ${windowLabel}`
+                      }
+                    </div>
+                    <div style={{ fontSize: "13px", fontWeight: 800, color: col }}>{fmtPnl(data.pnl)}</div>
+                  </div>
+                );
+              })()}
+            </Card>
 
             {/* ── ROW 3: Master Start/Stop button ── */}
             <div style={{ display: "flex", justifyContent: "center", padding: "4px 0 8px" }}>
