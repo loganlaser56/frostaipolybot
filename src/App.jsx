@@ -61,29 +61,25 @@ async function proxyFetch(url, opts = {}) {
 // ── Market discovery (Gamma API) ──────────────────────────────────────────────
 async function fetchMarkets(limit = 30) {
   try {
+    // Note: slug=btc returns [] — use tag=crypto and filter by question text
     const r = await proxyFetch(
-      `${GAMMA}/markets?active=true&closed=false&limit=${limit}&tag=crypto&slug=btc`
+      `${GAMMA}/markets?active=true&closed=false&limit=${limit}&tag=crypto`
     );
     if (r) {
       const text = await r.text();
-      const match = text.replace(/```json|```/g, "").trim().match(/\[[\s\S]*\]/);
-      if (match) {
-        const data = JSON.parse(match[0]);
-        // Filter to BTC 5-min up/down candle markets
-        const btc5m = data.filter(m =>
-          m.question && (
-            m.question.toLowerCase().includes("btc") ||
-            m.question.toLowerCase().includes("bitcoin")
-          ) && (
-            m.question.toLowerCase().includes("5") ||
-            m.question.toLowerCase().includes("minute") ||
-            m.question.toLowerCase().includes("candle") ||
-            m.question.toLowerCase().includes("up") ||
-            m.question.toLowerCase().includes("higher")
-          )
+      // Handle both plain array and wrapped object responses
+      let data = null;
+      try { data = JSON.parse(text); } catch {}
+      if (!Array.isArray(data)) {
+        const match = text.match(/\[[\s\S]*\]/);
+        if (match) try { data = JSON.parse(match[0]); } catch {}
+      }
+      if (Array.isArray(data) && data.length > 0) {
+        const q = s => s?.toLowerCase() || "";
+        const btc = data.filter(m =>
+          q(m.question).includes("btc") || q(m.question).includes("bitcoin")
         );
-        if (btc5m.length > 0) return btc5m;
-        if (data.length > 0) return data;
+        return btc.length > 0 ? btc : data;
       }
     }
   } catch {}
@@ -276,11 +272,15 @@ async function pollClobPrice(tokenId, onPrice, onVol, onBook) {
 }
 
 // Parse YES price from a market (outcomePrices is a JSON string array)
+function parseArr(v) {
+  if (Array.isArray(v)) return v;
+  try { return JSON.parse(v || "[]"); } catch { return []; }
+}
 function parseYesPrice(market) {
   try {
-    const prices = JSON.parse(market.outcomePrices || "[]");
-    const outcomes = JSON.parse(market.outcomes || "[]");
-    const yesIdx = outcomes.findIndex(o => o.toLowerCase() === "yes");
+    const prices = parseArr(market.outcomePrices);
+    const outcomes = parseArr(market.outcomes);
+    const yesIdx = outcomes.findIndex(o => String(o).toLowerCase() === "yes");
     const price = yesIdx >= 0 ? parseFloat(prices[yesIdx]) : parseFloat(prices[0]);
     return isNaN(price) ? 50 : Math.round(price * 100);
   } catch { return 50; }
@@ -732,12 +732,14 @@ export default function App() {
     if (priceFeedRef.current) priceFeedRef.current();
     if (pollRef.current) clearInterval(pollRef.current);
 
-    // Get YES token ID (index 0 = YES, index 1 = NO)
+    // Get YES token ID — clobTokenIds can be an array or a JSON string
     let tokenId = null;
     try {
-      const tokens = JSON.parse(market.clobTokenIds || "[]");
-      tokenId = tokens[0] || market.conditionId;
-    } catch { tokenId = market.conditionId; }
+      let ids = market.clobTokenIds;
+      if (typeof ids === "string") ids = JSON.parse(ids);
+      if (Array.isArray(ids) && ids[0]) tokenId = String(ids[0]);
+    } catch {}
+    if (!tokenId) tokenId = market.conditionId || market.condition_id || null;
 
     if (!tokenId) return;
 
