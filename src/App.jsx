@@ -35,7 +35,7 @@ const STATIC_MARKETS = [
 const GAMMA  = "https://gamma-api.polymarket.com";
 const CLOB   = "https://clob.polymarket.com";
 const DATA   = "https://data-api.polymarket.com";
-const WSS    = "wss://ws-subscriptions-clob.polymarket.com/ws/";
+const WSS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 // CORS proxy fallback for sandbox environments
 async function proxyFetch(url, opts = {}) {
@@ -173,6 +173,7 @@ function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
   let ws = null;
   let alive = true;
   let reconnectDelay = 1000;
+  let pingTimer = null;
 
   function connect() {
     if (!alive) return;
@@ -182,47 +183,56 @@ function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
 
       ws.onopen = () => {
         reconnectDelay = 1000;
-        // Subscribe to the market channel for this token
+        // Correct Polymarket CLOB WS subscription format
         ws.send(JSON.stringify({
-          auth: {},
-          type: "Market",
-          markets: [tokenId]
+          assets_ids: [tokenId],
+          type: "market",
+          custom_feature_enabled: true
         }));
+        // Heartbeat — server drops connection without a PING every ~10s
+        pingTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send("PING");
+        }, 10_000);
       };
 
       ws.onmessage = (e) => {
+        if (e.data === "PONG") return;
         try {
           const msgs = JSON.parse(e.data);
           const list = Array.isArray(msgs) ? msgs : [msgs];
 
           for (const msg of list) {
-            // Price from last trade
-            if (msg.last_trade_price) {
-              const px = parseFloat(msg.last_trade_price) * 100;
+            const et = msg.event_type;
+
+            // Last trade price
+            if (et === "last_trade_price" && msg.price) {
+              const px = parseFloat(msg.price) * 100;
               if (!isNaN(px) && px > 0) { onPrice(px); onStatus("live"); }
             }
-            // Price from order book mid
-            if (msg.bids && msg.asks) {
+
+            // Full order book snapshot
+            if (et === "book" && msg.bids && msg.asks) {
               const bestBid = msg.bids?.[0]?.price;
               const bestAsk = msg.asks?.[0]?.price;
               if (bestBid && bestAsk) {
                 const mid = (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 * 100;
                 if (!isNaN(mid) && mid > 0) { onPrice(mid); onStatus("live"); }
-                // Volume = sum of top 5 ask sizes (liquidity available)
                 const askVol = msg.asks.slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0);
                 const bidVol = msg.bids.slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0);
                 onVol(askVol + bidVol);
                 onBook({ bids: msg.bids.slice(0, 5), asks: msg.asks.slice(0, 5) });
               }
             }
-            // Volume from trade events
-            if (msg.type === "trade" && msg.size) {
-              onVol(parseFloat(msg.size));
-              onStatus("live");
+
+            // Price change / best bid-ask tick
+            if ((et === "price_change" || et === "best_bid_ask") && msg.best_bid && msg.best_ask) {
+              const mid = (parseFloat(msg.best_bid) + parseFloat(msg.best_ask)) / 2 * 100;
+              if (!isNaN(mid) && mid > 0) { onPrice(mid); onStatus("live"); }
             }
-            // Polymarket sends "tick_size" on open — confirms connection
-            if (msg.tick_size || msg.market) {
-              onStatus("live");
+
+            // Trade fill — use as volume tick
+            if (et === "last_trade_price" && msg.size) {
+              onVol(parseFloat(msg.size));
             }
           }
         } catch {}
@@ -230,6 +240,7 @@ function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
 
       ws.onerror = () => { onStatus("error"); };
       ws.onclose = () => {
+        clearInterval(pingTimer);
         onStatus("reconnecting");
         if (alive) {
           setTimeout(connect, reconnectDelay);
@@ -240,7 +251,7 @@ function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
   }
 
   connect();
-  return () => { alive = false; ws?.close(); onStatus("disconnected"); };
+  return () => { alive = false; clearInterval(pingTimer); ws?.close(); onStatus("disconnected"); };
 }
 
 // ── Poll CLOB REST for latest price + orderbook (fallback when WS blocked) ────
@@ -669,6 +680,17 @@ export default function App() {
     const t = setInterval(loadMarkets, 30_000);
     return () => clearInterval(t);
   }, []);
+
+  // Auto-connect WS to the first market that has a real token ID (runs once on first load)
+  const autoConnectedRef = useRef(false);
+  useEffect(() => {
+    if (autoConnectedRef.current || markets.length === 0) return;
+    const m = markets.find(mkt => {
+      try { return !!(JSON.parse(mkt.clobTokenIds || "[]")[0] || mkt.conditionId); }
+      catch { return !!mkt.conditionId; }
+    });
+    if (m) { autoConnectedRef.current = true; handleSelectMarket(m); }
+  }, [markets]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync creds ref whenever credentials change
   useEffect(() => {
