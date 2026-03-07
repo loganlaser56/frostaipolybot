@@ -595,6 +595,7 @@ export default function App() {
   const [winCount, setWinCount] = useState(0);
   const [tradeCount, setTradeCount] = useState(0);
   const [balance, setBalance] = useState(50);
+  const [pnlTick, setPnlTick] = useState(0); // ticks every 30s to drop expired trades from window counters
 
   const timerRef = useRef(null);
   const edgeRef = useRef(edgeScore);
@@ -748,6 +749,12 @@ export default function App() {
   useEffect(() => () => {
     if (priceFeedRef.current) priceFeedRef.current();
     if (pollRef.current) clearInterval(pollRef.current);
+  }, []);
+
+  // Tick every 30s so time-window PnL counters drop expired trades naturally
+  useEffect(() => {
+    const t = setInterval(() => setPnlTick(v => v + 1), 30_000);
+    return () => clearInterval(t);
   }, []);
 
   // ── Adaptive strategy adjuster ────────────────────────────────────────────
@@ -906,6 +913,7 @@ export default function App() {
     const trade = {
       id,
       time: new Date().toLocaleTimeString(),
+      timestamp: Date.now(),
       market: selectedMarket.question?.slice(0, 50) + "…",
       side, label,
       price: fmt(price),
@@ -996,6 +1004,19 @@ export default function App() {
   const lastPrice = candles[candles.length - 1]?.close || 50;
   const filteredMarkets = markets.filter(m => !marketSearch || m.question?.toLowerCase().includes(marketSearch.toLowerCase()));
 
+  // Time-window PnL counters (pnlTick forces recompute every 30s to drop expired trades)
+  void pnlTick;
+  const _now = Date.now();
+  const _closed = trades.filter(t => t.status === "closed" && t.timestamp);
+  const pnlWindows = [
+    { label: "30 MIN",  ms: 30 * 60_000 },
+    { label: "1 HOUR",  ms: 60 * 60_000 },
+    { label: "1 DAY",   ms: 24 * 60 * 60_000 },
+  ].map(w => {
+    const wt = _closed.filter(t => _now - t.timestamp < w.ms);
+    return { label: w.label, pnl: wt.reduce((s, t) => s + (t.pnl || 0), 0), count: wt.length };
+  });
+
   return (
     <div style={{ minHeight: "100vh", background: "#080808", color: "#fff", fontFamily: "'DM Sans', -apple-system, sans-serif" }}>
       <style>{`
@@ -1070,6 +1091,20 @@ export default function App() {
             <div style={{ fontSize: "9px", color: "#999", fontWeight: 700, letterSpacing: "0.08em" }}>PORTFOLIO</div>
             <div style={{ fontSize: "16px", fontWeight: 800, lineHeight: 1.2 }}>${fmt(balance)}</div>
             <div style={{ fontSize: "9px", color: totalPnl >= 0 ? "#00c805" : "#ff5000", fontWeight: 700 }}>{fmtPnl(totalPnl)}</div>
+          </div>
+          <div style={{ width: "1px", height: "36px", background: "#1e1e1e" }} />
+          {/* Earnings Counter */}
+          <div style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: "14px", padding: "6px 14px" }}>
+            <div style={{ fontSize: "9px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "4px" }}>EARNINGS</div>
+            {pnlWindows.map(({ label, pnl }) => {
+              const col = pnl > 0 ? "#00c805" : pnl < 0 ? "#ff5000" : "#555";
+              return (
+                <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px" }}>
+                  <span style={{ fontSize: "9px", color: "#555", fontWeight: 700 }}>{label}</span>
+                  <span style={{ fontSize: "11px", fontWeight: 800, color: col }}>{pnl >= 0 ? "+" : "-"}${fmt(Math.abs(pnl))}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
