@@ -548,6 +548,8 @@ export default function App() {
   const [connected, setConnected]       = useState(false);
   const [liveMode, setLiveMode]         = useState(false);   // false = paper, true = real orders
   const [connError, setConnError]       = useState("");
+  const [keyGenLoading, setKeyGenLoading] = useState(false);
+  const [keyGenStatus, setKeyGenStatus]   = useState(null); // { ok, msg }
   const [positions, setPositions]       = useState([]);       // open Polymarket positions
   const [liveBalance, setLiveBalance]   = useState(null);     // on-chain USDC balance
   const [orderLog, setOrderLog]         = useState([]);       // CLOB order responses
@@ -1043,6 +1045,34 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [volBotOn, spikeThreshold, triggerEntry, liveYesPrice]);
 
+  // ── Generate API keys from private key via ClobClient L1 auth ────────────────
+  const generateApiKeys = async () => {
+    if (!privateKey.trim()) { setKeyGenStatus({ ok: false, msg: "Enter your private key first" }); return; }
+    setKeyGenLoading(true);
+    setKeyGenStatus(null);
+    try {
+      const wallet = new Wallet(privateKey.trim());
+      const sigType = funderAddress ? SignatureType.POLY_PROXY : SignatureType.EOA;
+      const client = new ClobClient(
+        "https://clob.polymarket.com",
+        137,
+        wallet,
+        undefined, // no creds needed — L1 auth uses the wallet directly
+        sigType,
+        funderAddress || undefined
+      );
+      const generated = await client.createOrDeriveApiKey();
+      setApiKey(generated.key);
+      setApiSecret(generated.secret);
+      setApiPassphrase(generated.passphrase);
+      setKeyGenStatus({ ok: true, msg: "Keys generated — ready to connect" });
+    } catch (e) {
+      setKeyGenStatus({ ok: false, msg: e?.message || "Failed to generate keys" });
+    } finally {
+      setKeyGenLoading(false);
+    }
+  };
+
   const anyOn = volBotOn || entryBotOn || edgeBotOn;
   const winRate = tradeCount > 0 ? Math.round((winCount / tradeCount) * 100) : 0;
   const lastPrice = candles[candles.length - 1]?.close || 50;
@@ -1174,7 +1204,7 @@ export default function App() {
             <Card glow={connected ? "#00c805" : undefined}>
               <div style={{ fontWeight: 800, fontSize: "17px", marginBottom: "2px" }}>🔑 Polymarket API Credentials</div>
               <div style={{ fontSize: "12px", color: "#777", marginBottom: "18px" }}>
-                Get your keys at <span style={{ color: "#4488ff" }}>polymarket.com → Settings → API</span>. Keys are stored in memory only and never sent anywhere except Polymarket's CLOB.
+                Enter your private key and funder address, then click <strong style={{ color: "#4488ff" }}>Generate API Keys</strong> to auto-fill the rest. Keys are stored in memory only.
               </div>
 
               {connected ? (
@@ -1250,9 +1280,28 @@ export default function App() {
                     ))}
                   </div>
 
+                  {/* Generate API Keys */}
+                  <div style={{ padding: "14px 16px", background: "#0a0a0a", border: "1px solid #1e1e1e", borderRadius: "12px" }}>
+                    <div style={{ fontSize: "10px", color: "#666", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "10px" }}>STEP 2 — GENERATE API KEYS</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                      <BubbleBtn active={!keyGenLoading} color="#4488ff" onClick={generateApiKeys} disabled={keyGenLoading}>
+                        {keyGenLoading ? "⏳ Generating…" : "⚡ Generate API Keys"}
+                      </BubbleBtn>
+                      {keyGenStatus && (
+                        <span style={{ fontSize: "12px", fontWeight: 600, color: keyGenStatus.ok ? "#00c805" : "#ff5000" }}>
+                          {keyGenStatus.ok ? "✅ " : "⚠️ "}{keyGenStatus.msg}
+                        </span>
+                      )}
+                      {!keyGenStatus && (
+                        <span style={{ fontSize: "11px", color: "#444" }}>Signs with your private key — no password needed</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Connect */}
                   <div style={{ display: "flex", gap: "10px", alignItems: "center", paddingTop: "4px" }}>
                     <BubbleBtn active color="#00c805" size="lg" onClick={() => {
-                      if (!apiKey.trim()) { setConnError("API Key is required"); return; }
+                      if (!apiKey.trim()) { setConnError("Generate API keys first"); return; }
                       setConnError("");
                       setConnected(true);
                     }}>
