@@ -1046,11 +1046,22 @@ export default function App() {
               {liveMode ? "🔴 LIVE" : "📄 PAPER"}
             </span>
           )}
-          {wsStatus === "live" && (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 9px", borderRadius: "100px", background: "#00c80510", border: "1px solid #00c80530", fontSize: "10px", fontWeight: 700, color: "#00c805" }}>
-              <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00c805", display: "inline-block", animation: "pulseGlow 0.8s ease infinite" }} /> WS
-            </span>
-          )}
+          {(() => {
+            const wsMap = {
+              live:         { label: "LIVE",       col: "#00c805", pulse: true  },
+              connecting:   { label: "CONNECTING", col: "#f5a623", pulse: true  },
+              reconnecting: { label: "RECONNECTING",col: "#f5a623", pulse: true  },
+              error:        { label: "WS ERROR",   col: "#ff5000", pulse: false },
+              disconnected: { label: "SIM",        col: "#555",    pulse: false },
+            };
+            const s = wsMap[wsStatus] || wsMap.disconnected;
+            return (
+              <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 9px", borderRadius: "100px", background: `${s.col}12`, border: `1px solid ${s.col}44`, fontSize: "10px", fontWeight: 700, color: s.col }}>
+                <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: s.col, display: "inline-block", animation: s.pulse ? "pulseGlow 0.9s ease infinite" : "none" }} />
+                {s.label}
+              </span>
+            );
+          })()}
           {anyOn && (() => {
             const colors = { normal: "#00c805", defensive: "#f5a623", recovery: "#ff5000", aggressive: "#4488ff" };
             const icons = { normal: "✅", defensive: "🛡️", recovery: "🔄", aggressive: "🚀" };
