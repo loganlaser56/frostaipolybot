@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { Wallet } from "ethers";
+import { ClobClient, OrderType as ClobOrderType, Side as ClobSide, SignatureType } from "@polymarket/clob-client";
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function fmt(n, d = 2) { return isNaN(n) ? "0.00" : Number(n).toFixed(d); }
@@ -118,48 +120,33 @@ async function fetchPositions(apiKey) {
   return null;
 }
 
-// ── Place order (CLOB — requires wallet private key + API creds) ──────────────
-// NOTE: Full EIP-712 signing requires ethers.js or a wallet provider.
-// This layer prepares the order payload and shows exactly what would be signed/sent.
-// To execute live: deploy outside Claude.ai and load ethers.js for signing.
-async function placeOrder({ tokenId, price, size, side, apiKey, privateKey }) {
-  // Order payload per Polymarket CLOB spec
-  const orderPayload = {
-    token_id: tokenId,
-    price: (price / 100).toFixed(4),   // convert cents to decimal (0.51)
-    size: size.toFixed(2),
-    side: side,                          // "BUY" or "SELL"
-    type: "FOK",                         // Fill-Or-Kill for quick scalps
-    time_in_force: "FOK",
-    expiration: 0,
-  };
-
+// ── Place order via official @polymarket/clob-client ─────────────────────────
+async function placeOrder({ tokenId, price, size, side, apiKey, apiSecret, apiPassphrase, privateKey, funderAddress }) {
   if (!privateKey || !apiKey) {
-    // Paper trading mode — return simulated fill
-    return {
-      status: "paper",
-      order: orderPayload,
-      fillPrice: price,
-      message: "Paper trade (connect wallet for live execution)"
-    };
+    return { status: "paper", message: "Paper trade (connect wallet for live execution)" };
   }
-
-  // Live execution path (requires ethers.js Wallet for EIP-712 signing)
-  // This will work when deployed with: import { Wallet } from "ethers"
   try {
-    const res = await fetch(`${CLOB}/order`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-        // L2 headers would be added here after EIP-712 signing
-      },
-      body: JSON.stringify(orderPayload)
-    });
-    const data = await res.json();
-    return { status: res.ok ? "filled" : "rejected", ...data };
+    const wallet = new Wallet(privateKey);
+    const sigType = funderAddress ? SignatureType.POLY_PROXY : SignatureType.EOA;
+    const client = new ClobClient(
+      "https://clob.polymarket.com",
+      137, // Polygon mainnet
+      wallet,
+      { key: apiKey, secret: apiSecret, passphrase: apiPassphrase },
+      sigType,
+      funderAddress || undefined
+    );
+    const priceDecimal = price / 100;
+    // Convert USD size → outcome token units (size / price = tokens)
+    const tokenSize = parseFloat((size / priceDecimal).toFixed(2));
+    const result = await client.createAndPostMarketOrder(
+      { tokenID: tokenId, price: priceDecimal, size: tokenSize, side },
+      undefined,
+      ClobOrderType.FOK
+    );
+    return { status: result?.success ? "filled" : "rejected", ...(result || {}) };
   } catch (e) {
-    return { status: "error", message: e.message };
+    return { status: "error", message: e?.message || String(e) };
   }
 }
 
@@ -566,6 +553,7 @@ export default function App() {
   const [orderLog, setOrderLog]         = useState([]);       // CLOB order responses
   const [wsStatus, setWsStatus]         = useState("disconnected"); // ws price feed status
   const creds = useRef({});
+  const liveModeRef = useRef(false);
 
   // Live market data
   const [markets, setMarkets] = useState([]);
@@ -696,6 +684,8 @@ export default function App() {
   useEffect(() => {
     creds.current = { privateKey, apiKey, apiSecret, apiPassphrase, funderAddress, walletType };
   }, [privateKey, apiKey, apiSecret, apiPassphrase, funderAddress, walletType]);
+
+  useEffect(() => { liveModeRef.current = liveMode; }, [liveMode]);
 
   // Fetch live positions when connected
   useEffect(() => {
@@ -951,6 +941,36 @@ export default function App() {
     setTradeMarkers(prev => [{ id, side, price, pnl: null }, ...prev.slice(0, 14)]);
     setTradeCount(c => c + 1);
     if (edgeBotOn) evaluateEntry(id, price, size, side);
+
+    // Submit live order to Polymarket CLOB when in live mode
+    if (liveModeRef.current && creds.current.apiKey && creds.current.privateKey) {
+      const ids = Array.isArray(selectedMarket.clobTokenIds)
+        ? selectedMarket.clobTokenIds
+        : (() => { try { return JSON.parse(selectedMarket.clobTokenIds || "[]"); } catch { return []; } })();
+      const tokenId = side === "YES" ? ids[0] : ids[1]; // YES=index 0, NO=index 1
+      if (tokenId) {
+        placeOrder({
+          tokenId: String(tokenId),
+          price, size,
+          side: ClobSide.BUY, // always BUY the relevant token (YES or NO)
+          apiKey:        creds.current.apiKey,
+          apiSecret:     creds.current.apiSecret,
+          apiPassphrase: creds.current.apiPassphrase,
+          privateKey:    creds.current.privateKey,
+          funderAddress: creds.current.funderAddress,
+        }).then(result => {
+          setOrderLog(log => [{
+            id,
+            time:    new Date().toLocaleTimeString(),
+            tokenId: String(tokenId).slice(0, 10) + "…",
+            side,
+            price:   fmt(price),
+            size:    fmt(size),
+            ...result,
+          }, ...log.slice(0, 49)]);
+        });
+      }
+    }
   }, [entryBotOn, edgeBotOn, maxBet, balance, selectedMarket, spikeThreshold, evaluateEntry]);
 
   // ── Volume bot loop — uses REAL Polymarket order book volume when available ──
