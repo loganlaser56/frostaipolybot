@@ -167,39 +167,101 @@ async function placeOrder({ tokenId, price, size, side, apiKey, privateKey }) {
   }
 }
 
-// ── WebSocket live price feed ─────────────────────────────────────────────────
-function createPriceFeed(tokenId, onPrice, onVol) {
+// ── Polymarket CLOB WebSocket — real YES price + order book volume ────────────
+// Polymarket market channel pushes: book updates, last trade price, volume
+function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
   let ws = null;
   let alive = true;
+  let reconnectDelay = 1000;
 
   function connect() {
     if (!alive) return;
+    onStatus("connecting");
     try {
       ws = new WebSocket(WSS);
+
       ws.onopen = () => {
+        reconnectDelay = 1000;
+        // Subscribe to the market channel for this token
         ws.send(JSON.stringify({
           auth: {},
           type: "Market",
           markets: [tokenId]
         }));
       };
+
       ws.onmessage = (e) => {
         try {
-          const msg = JSON.parse(e.data);
-          if (msg.event_type === "price_change" || msg.price) {
-            const px = parseFloat(msg.price || msg.yes_price) * 100;
-            if (!isNaN(px)) onPrice(px);
+          const msgs = JSON.parse(e.data);
+          const list = Array.isArray(msgs) ? msgs : [msgs];
+
+          for (const msg of list) {
+            // Price from last trade
+            if (msg.last_trade_price) {
+              const px = parseFloat(msg.last_trade_price) * 100;
+              if (!isNaN(px) && px > 0) { onPrice(px); onStatus("live"); }
+            }
+            // Price from order book mid
+            if (msg.bids && msg.asks) {
+              const bestBid = msg.bids?.[0]?.price;
+              const bestAsk = msg.asks?.[0]?.price;
+              if (bestBid && bestAsk) {
+                const mid = (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 * 100;
+                if (!isNaN(mid) && mid > 0) { onPrice(mid); onStatus("live"); }
+                // Volume = sum of top 5 ask sizes (liquidity available)
+                const askVol = msg.asks.slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0);
+                const bidVol = msg.bids.slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0);
+                onVol(askVol + bidVol);
+                onBook({ bids: msg.bids.slice(0, 5), asks: msg.asks.slice(0, 5) });
+              }
+            }
+            // Volume from trade events
+            if (msg.type === "trade" && msg.size) {
+              onVol(parseFloat(msg.size));
+              onStatus("live");
+            }
+            // Polymarket sends "tick_size" on open — confirms connection
+            if (msg.tick_size || msg.market) {
+              onStatus("live");
+            }
           }
-          if (msg.volume) onVol(parseFloat(msg.volume));
         } catch {}
       };
-      ws.onerror = () => {};
-      ws.onclose = () => { if (alive) setTimeout(connect, 2000); };
-    } catch {}
+
+      ws.onerror = () => { onStatus("error"); };
+      ws.onclose = () => {
+        onStatus("reconnecting");
+        if (alive) {
+          setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+        }
+      };
+    } catch { onStatus("error"); }
   }
 
   connect();
-  return () => { alive = false; ws?.close(); };
+  return () => { alive = false; ws?.close(); onStatus("disconnected"); };
+}
+
+// ── Poll CLOB REST for latest price + orderbook (fallback when WS blocked) ────
+async function pollClobPrice(tokenId, onPrice, onVol, onBook) {
+  try {
+    // Get best bid/ask
+    const r = await proxyFetch(`${CLOB}/book?token_id=${tokenId}`);
+    if (r) {
+      const book = await r.json();
+      const bestBid = book.bids?.[0]?.price;
+      const bestAsk = book.asks?.[0]?.price;
+      if (bestBid && bestAsk) {
+        const mid = (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 * 100;
+        if (!isNaN(mid) && mid > 0) onPrice(mid);
+        const vol = [...(book.bids||[]), ...(book.asks||[])].slice(0, 10)
+          .reduce((s, x) => s + parseFloat(x.size || 0), 0);
+        onVol(vol);
+        onBook({ bids: book.bids?.slice(0,5) || [], asks: book.asks?.slice(0,5) || [] });
+      }
+    }
+  } catch {}
 }
 
 // Parse YES price from a market (outcomePrices is a JSON string array)
@@ -538,6 +600,12 @@ export default function App() {
   const edgeRef = useRef(edgeScore);
   edgeRef.current = edgeScore;
 
+  // Live Polymarket data
+  const [orderBook, setOrderBook] = useState({ bids: [], asks: [] });
+  const [liveYesPrice, setLiveYesPrice] = useState(null);
+  const liveVolBuffer = useRef([]); // accumulates real vol ticks between candle closes
+  const lastCandleTime = useRef(Date.now());
+
   // ── Adaptive strategy engine state ────────────────────────────────────────
   const [strategy, setStrategy] = useState("normal"); // "normal" | "defensive" | "recovery" | "aggressive"
   const [strategyLog, setStrategyLog] = useState([]);
@@ -623,8 +691,8 @@ export default function App() {
   }, [connected, apiKey]);
 
   const priceFeedRef = useRef(null);
+  const pollRef = useRef(null);
 
-  // When market selected: re-seed candles + connect live price WebSocket
   const handleSelectMarket = (market) => {
     setSelectedMarket(market);
     const initPrice = parseYesPrice(market);
@@ -634,35 +702,53 @@ export default function App() {
     setTradeMarkers([]);
     setEntryPrice(null);
     setVolAlerts([]);
+    liveVolBuffer.current = [];
+    lastCandleTime.current = Date.now();
 
-    // Disconnect previous price feed
+    // Disconnect previous feeds
     if (priceFeedRef.current) priceFeedRef.current();
+    if (pollRef.current) clearInterval(pollRef.current);
 
-    // Try to get token ID for live price feed
-    const tokenId = market.clobTokenIds
-      ? JSON.parse(market.clobTokenIds)[0]
-      : market.conditionId;
+    // Get YES token ID (index 0 = YES, index 1 = NO)
+    let tokenId = null;
+    try {
+      const tokens = JSON.parse(market.clobTokenIds || "[]");
+      tokenId = tokens[0] || market.conditionId;
+    } catch { tokenId = market.conditionId; }
 
-    if (tokenId) {
-      setWsStatus("connecting");
-      priceFeedRef.current = createPriceFeed(
-        tokenId,
-        (px) => {
-          setWsStatus("live");
-          // Feed real price ticks into candle engine as close updates
-          setCandles(prev => {
-            const last = prev[prev.length - 1];
-            const updated = [...prev.slice(0, -1), { ...last, close: px, high: Math.max(last.high, px), low: Math.min(last.low, px) }];
-            return updated;
-          });
-        },
-        (vol) => {} // volume updates handled separately
-      );
-    }
+    if (!tokenId) return;
+
+    const onPrice = (px) => {
+      setLiveYesPrice(px);
+      setCandles(prev => {
+        const last = prev[prev.length - 1];
+        return [...prev.slice(0, -1), {
+          ...last,
+          close: px,
+          high: Math.max(last.high, px),
+          low: Math.min(last.low, px)
+        }];
+      });
+    };
+
+    const onVol = (v) => { liveVolBuffer.current.push(v); };
+    const onBook = (book) => setOrderBook(book);
+    const onStatus = (s) => setWsStatus(s);
+
+    // Try WebSocket first
+    setWsStatus("connecting");
+    priceFeedRef.current = createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus);
+
+    // Also poll REST every 3s as reliable fallback (works even when WS is blocked by CORS)
+    pollRef.current = setInterval(() => {
+      pollClobPrice(tokenId, onPrice, onVol, onBook);
+    }, 3000);
   };
 
-  // Cleanup price feed on unmount
-  useEffect(() => () => { if (priceFeedRef.current) priceFeedRef.current(); }, []);
+  useEffect(() => () => {
+    if (priceFeedRef.current) priceFeedRef.current();
+    if (pollRef.current) clearInterval(pollRef.current);
+  }, []);
 
   // ── Adaptive strategy adjuster ────────────────────────────────────────────
   const adjustStrategy = useCallback((newBalance, newWinCount, newTradeCount, newConsecLosses, newConsecWins) => {
@@ -835,17 +921,41 @@ export default function App() {
     if (edgeBotOn) evaluateEntry(id, price, size, side);
   }, [entryBotOn, edgeBotOn, maxBet, balance, selectedMarket, spikeThreshold, evaluateEntry]);
 
-  // ── Volume bot loop — proper rolling average spike detection ─────────────
+  // ── Volume bot loop — uses REAL Polymarket order book volume when available ──
   useEffect(() => {
     if (!volBotOn) { clearInterval(timerRef.current); return; }
     timerRef.current = setInterval(() => {
       setCandles(prev => {
         const last = prev[prev.length - 1];
-        // Simulate realistic BTC 5-min volume (baseline 50-150, spikes 3-6x)
+
+        // Use real accumulated volume from live feed, fall back to simulation
+        const realVolTicks = liveVolBuffer.current.splice(0);
+        const hasRealVol = realVolTicks.length > 0;
+        const realVol = hasRealVol ? realVolTicks.reduce((a, v) => a + v, 0) : 0;
+
+        // Simulated volume as baseline when no real data
         const baseVol = 80 + Math.random() * 70;
         const spikeRoll = Math.random();
-        const vol = spikeRoll < 0.18 ? baseVol * (2 + Math.random() * 2.5) : baseVol;
-        const newC = { ...genCandle(last.close), vol };
+        const simVol = spikeRoll < 0.18 ? baseVol * (2 + Math.random() * 2.5) : baseVol;
+
+        // Prefer real volume; blend if partial data
+        const vol = hasRealVol ? Math.max(realVol, 1) : simVol;
+
+        // Build new candle — use real YES price if available, else random walk
+        const currentClose = liveYesPrice || last.close;
+        const newClose = hasRealVol
+          ? clamp(currentClose + (Math.random() - 0.48) * 0.8, 1, 99) // tight walk around real price
+          : clamp(last.close + (Math.random() - 0.48) * 1.6, 5, 95);
+
+        const newC = {
+          open: last.close,
+          close: newClose,
+          high: Math.max(last.close, newClose) + Math.random() * (hasRealVol ? 0.5 : 1.2),
+          low: Math.min(last.close, newClose) - Math.random() * (hasRealVol ? 0.5 : 1.2),
+          vol,
+          isLive: hasRealVol
+        };
+
         const updated = [...prev.slice(-99), newC];
         const idx = updated.length - 1;
 
@@ -855,21 +965,21 @@ export default function App() {
           const avg = window.reduce((a, c) => a + c.vol, 0) / window.length;
           const ratio = vol / avg;
           if (ratio >= spikeThreshold) {
-            // Confirm: price also moved meaningfully (body > 40% of range)
             const body = Math.abs(newC.close - newC.open);
-            const range = newC.high - newC.low || 1;
+            const range = (newC.high - newC.low) || 1;
             const strongCandle = body / range > 0.2;
             if (strongCandle) {
               setSpikes(s => [...s.slice(-9), idx]);
               setVolAlerts(a => [{
                 id: Date.now(),
                 time: new Date().toLocaleTimeString(),
-                vol: fmt(vol, 0),
-                avg: fmt(avg, 0),
+                vol: fmt(vol, 1),
+                avg: fmt(avg, 1),
                 ratio: fmt(ratio, 2),
                 price: fmt(newC.close),
                 dir: newC.close >= newC.open ? "UP" : "DOWN",
-                body: fmt(body / range * 100, 0)
+                body: fmt(body / range * 100, 0),
+                isLive: hasRealVol
               }, ...a.slice(0, 29)]);
               triggerEntry(newC.close, newC.close >= newC.open, ratio);
             }
@@ -879,7 +989,7 @@ export default function App() {
       });
     }, 1200);
     return () => clearInterval(timerRef.current);
-  }, [volBotOn, spikeThreshold, triggerEntry]);
+  }, [volBotOn, spikeThreshold, triggerEntry, liveYesPrice]);
 
   const anyOn = volBotOn || entryBotOn || edgeBotOn;
   const winRate = tradeCount > 0 ? Math.round((winCount / tradeCount) * 100) : 0;
@@ -1155,14 +1265,43 @@ export default function App() {
                   <LiveTradeChart candles={candles} tradeMarkers={tradeMarkers} entryPrice={entryPrice} />
                 </div>
 
-                {/* Active market */}
+                {/* Active market + live price */}
                 {selectedMarket && (
-                  <div style={{ background: "#0d0d0d", borderRadius: "10px", padding: "10px 12px", marginBottom: "10px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div style={{ fontSize: "12px", color: "#ddd", flex: 1 }}>{selectedMarket.question}</div>
-                    <div style={{ display: "flex", gap: "6px", marginLeft: "10px", flexShrink: 0 }}>
-                      <Badge color="green">YES {parseYesPrice(selectedMarket)}¢</Badge>
-                      <Badge color="red">NO {100 - parseYesPrice(selectedMarket)}¢</Badge>
+                  <div style={{ background: "#0d0d0d", borderRadius: "10px", padding: "10px 12px", marginBottom: "10px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                      <div style={{ fontSize: "11px", color: "#ddd", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedMarket.question}</div>
+                      <div style={{ display: "flex", gap: "5px", marginLeft: "8px", flexShrink: 0, alignItems: "center" }}>
+                        {wsStatus === "live"
+                          ? <span style={{ fontSize: "9px", color: "#00c805", fontWeight: 700, display: "flex", alignItems: "center", gap: "3px" }}><span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00c805", display: "inline-block", animation: "pulseGlow 1s infinite" }} />LIVE</span>
+                          : <span style={{ fontSize: "9px", color: "#f5a623", fontWeight: 700 }}>{wsStatus === "connecting" ? "⟳ connecting" : "SIM"}</span>
+                        }
+                        <Badge color="green">YES {liveYesPrice ? fmt(liveYesPrice, 1) : parseYesPrice(selectedMarket)}¢</Badge>
+                        <Badge color="red">NO {liveYesPrice ? fmt(100 - liveYesPrice, 1) : 100 - parseYesPrice(selectedMarket)}¢</Badge>
+                      </div>
                     </div>
+                    {/* Order book — top 3 bids/asks */}
+                    {orderBook.bids?.length > 0 && (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                        <div>
+                          <div style={{ fontSize: "9px", color: "#00c805", fontWeight: 700, marginBottom: "3px" }}>BIDS</div>
+                          {orderBook.bids.slice(0,3).map((b,i) => (
+                            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", padding: "1px 0" }}>
+                              <span style={{ color: "#00c805" }}>{(parseFloat(b.price)*100).toFixed(1)}¢</span>
+                              <span style={{ color: "#555" }}>{parseFloat(b.size).toFixed(0)}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <div>
+                          <div style={{ fontSize: "9px", color: "#ff5000", fontWeight: 700, marginBottom: "3px" }}>ASKS</div>
+                          {orderBook.asks.slice(0,3).map((a,i) => (
+                            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", padding: "1px 0" }}>
+                              <span style={{ color: "#ff5000" }}>{(parseFloat(a.price)*100).toFixed(1)}¢</span>
+                              <span style={{ color: "#555" }}>{parseFloat(a.size).toFixed(0)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1333,7 +1472,7 @@ export default function App() {
                       <div key={a.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 6px", borderBottom: "1px solid #141414", animation: "slideIn 0.25s ease" }}>
                         <div>
                           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span style={{ fontWeight: 800, fontSize: "12px", color: a.dir === "UP" ? "#00c805" : "#ff5000" }}>{a.dir === "UP" ? "↑" : "↓"} ×{a.ratio}</span>
+                            <span style={{ fontWeight: 800, fontSize: "12px", color: a.dir === "UP" ? "#00c805" : "#ff5000" }}>{a.dir === "UP" ? "↑" : "↓"} ×{a.ratio}{a.isLive && <span style={{ fontSize:"9px", color:"#00c805", marginLeft:"4px" }}>●LIVE</span>}</span>
                             <span style={{ fontSize: "10px", color: "#bbb" }}>{a.time}</span>
                           </div>
                           <div style={{ fontSize: "10px", color: "#666", marginTop: "1px" }}>Vol {a.vol} · Avg {a.avg} · Body {a.body}%</div>
