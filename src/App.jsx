@@ -606,7 +606,7 @@ export default function App() {
   const [winCount, setWinCount] = useState(0);
   const [tradeCount, setTradeCount] = useState(0);
   const [balance, setBalance] = useState(50);
-  const [pnlTick, setPnlTick] = useState(0); // ticks every 30s to drop expired trades from window counters
+  const [pnlTick, setPnlTick] = useState(0); // ticks every 10s to drop expired trades from window counters
 
   const timerRef = useRef(null);
   const edgeRef = useRef(edgeScore);
@@ -777,7 +777,7 @@ export default function App() {
 
   // Tick every 30s so time-window PnL counters drop expired trades naturally
   useEffect(() => {
-    const t = setInterval(() => setPnlTick(v => v + 1), 30_000);
+    const t = setInterval(() => setPnlTick(v => v + 1), 10_000);
     return () => clearInterval(t);
   }, []);
 
@@ -1028,14 +1028,14 @@ export default function App() {
   const lastPrice = candles[candles.length - 1]?.close || 50;
   const filteredMarkets = markets.filter(m => !marketSearch || m.question?.toLowerCase().includes(marketSearch.toLowerCase()));
 
-  // Time-window PnL counters (pnlTick forces recompute every 30s to drop expired trades)
+  // Time-window PnL counters (pnlTick forces recompute every 10s to drop expired trades)
   void pnlTick;
   const _now = Date.now();
   const _closed = trades.filter(t => t.status === "closed" && t.timestamp);
   const pnlWindows = [
-    { label: "30 MIN",  ms: 30 * 60_000 },
-    { label: "1 HOUR",  ms: 60 * 60_000 },
-    { label: "1 DAY",   ms: 24 * 60 * 60_000 },
+    { label: "1 MIN",  ms: 60_000 },
+    { label: "1 HOUR", ms: 60 * 60_000 },
+    { label: "1 DAY",  ms: 24 * 60 * 60_000 },
   ].map(w => {
     const wt = _closed.filter(t => _now - t.timestamp < w.ms);
     return { label: w.label, pnl: wt.reduce((s, t) => s + (t.pnl || 0), 0), count: wt.length };
