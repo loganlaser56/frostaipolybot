@@ -1548,7 +1548,7 @@ export default function App() {
               </Card>
 
               {/* Edge Builder + Analysis Bot — right column */}
-              <Card glow={edgeBotOn ? "#f5a623" : undefined}>
+              <Card glow={botActive ? "#f5a623" : undefined}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                     <span style={{ fontSize: "18px" }}>🧠</span>
@@ -1815,15 +1815,10 @@ export default function App() {
 
             {/* ── ROW 3: Master Start/Stop button ── */}
             <div style={{ display: "flex", justifyContent: "center", padding: "4px 0 8px" }}>
-              <button onClick={() => {
-                const next = !anyOn;
-                setVolBotOn(next);
-                setEntryBotOn(next);
-                setEdgeBotOn(next);
-              }} style={{
+              <button onClick={() => setBotActive(v => !v)} style={{
                 padding: "18px 64px",
                 borderRadius: "100px",
-                background: anyOn ? "#ff5000" : "#00c805",
+                background: botActive ? "#ff5000" : "#00c805",
                 color: "#000",
                 border: "none",
                 fontFamily: "inherit",
@@ -1831,28 +1826,14 @@ export default function App() {
                 fontSize: "17px",
                 cursor: "pointer",
                 letterSpacing: "-0.01em",
-                boxShadow: anyOn ? "0 0 40px #ff500066" : "0 0 40px #00c80566",
+                boxShadow: botActive ? "0 0 40px #ff500066" : "0 0 40px #00c80566",
                 transition: "all 0.2s",
                 display: "flex",
                 alignItems: "center",
                 gap: "10px"
               }}>
-                {anyOn ? "⏹ Stop All Bots" : "▶ Start All Bots"}
+                {botActive ? "⏹ Stop Bot" : "▶ Start Bot"}
               </button>
-            </div>
-
-            {/* Bot status pills */}
-            <div style={{ display: "flex", justifyContent: "center", gap: "10px", paddingBottom: "4px" }}>
-              {[
-                { label: "Volume Bot", on: volBotOn, color: "#00c805" },
-                { label: "Entry Bot", on: entryBotOn, color: "#4488ff" },
-                { label: "Edge Builder", on: edgeBotOn, color: "#f5a623" },
-              ].map(b => (
-                <div key={b.label} style={{ display: "flex", alignItems: "center", gap: "5px", padding: "4px 12px", borderRadius: "100px", background: b.on ? `${b.color}15` : "#111", border: `1px solid ${b.on ? b.color + "44" : "#1e1e1e"}` }}>
-                  <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: b.on ? b.color : "#333", display: "inline-block", boxShadow: b.on ? `0 0 6px ${b.color}` : "none", animation: b.on ? "pulseGlow 1.4s ease infinite" : "none" }} />
-                  <span style={{ fontSize: "11px", fontWeight: 700, color: b.on ? b.color : "#555" }}>{b.label}</span>
-                </div>
-              ))}
             </div>
 
           </div>
