@@ -645,6 +645,13 @@ export default function App() {
     const ticker = market.id;
     if (!ticker) return;
 
+    // Static fallback markets are simulated — skip live API calls entirely
+    const isStatic = ticker.startsWith("KXBTCD-T");
+    if (isStatic) {
+      setWsStatus("disconnected");
+      return;
+    }
+
     const onPrice = (px) => {
       setLiveYesPrice(px);
       setCandles(prev => {
