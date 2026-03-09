@@ -75,10 +75,89 @@ async function placeOrder({ ticker, price, size, side, apiKeyId, rsaPrivateKey }
     });
     const data = await resp.json();
     if (!resp.ok) return { status: "error", message: data.error || `HTTP ${resp.status}` };
-    return { status: data.success ? "filled" : "rejected", orderId: data.orderId, orderStatus: data.status, message: data.error };
+    return {
+      status: data.success ? "filled" : "rejected",
+      orderId: data.orderId, orderStatus: data.status, message: data.error,
+      contracts, // pass back so caller can store for close
+    };
   } catch (e) {
     return { status: "error", message: e?.message || String(e) };
   }
+}
+
+// ── Close position (sell contracts) via Netlify Function ─────────────────────
+async function closePosition({ ticker, side, contracts, currentPriceCents, apiKeyId, rsaPrivateKey }) {
+  if (!apiKeyId || !rsaPrivateKey) return { status: "skipped" };
+  try {
+    const resp = await fetch("/.netlify/functions/place-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "close", ticker, side, contracts, currentPriceCents, apiKeyId, rsaPrivateKey }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return { status: "error", message: data.error || `HTTP ${resp.status}` };
+    return { status: data.success ? "closed" : "rejected", orderId: data.orderId };
+  } catch (e) {
+    return { status: "error", message: e?.message || String(e) };
+  }
+}
+
+// ── Price action analysis — studies candles before committing to a position ───
+function analyzePriceAction(candles, currentPrice) {
+  if (candles.length < 15) return { signal: "WAIT", confidence: 0, reason: "Collecting candle data…" };
+
+  const recent = candles.slice(-20);
+  const last5  = candles.slice(-5);
+  const last10 = candles.slice(-10);
+
+  // 1. Momentum: net close move over last 5 candles
+  const momentum = last5[last5.length - 1].close - last5[0].open;
+
+  // 2. Trend: bull vs bear candle count in last 10
+  const bullCount = last10.filter(c => c.close >= c.open).length;
+  const bearCount = 10 - bullCount;
+
+  // 3. Volume expansion: last 5 avg vs prior 15 avg
+  const recentVol = last5.reduce((a, c) => a + c.vol, 0) / 5;
+  const priorVol  = recent.slice(0, 15).reduce((a, c) => a + c.vol, 0) / 15;
+  const volUp = recentVol > priorVol * 1.08;
+
+  // 4. Price position in 20-candle range
+  const rangeHigh = Math.max(...recent.map(c => c.high));
+  const rangeLow  = Math.min(...recent.map(c => c.low));
+  const rangePos  = (currentPrice - rangeLow) / Math.max(rangeHigh - rangeLow, 1);
+
+  // 5. Last 3 candles: body strength (avoid doji entries)
+  const last3 = candles.slice(-3);
+  const bodyQual = last3.reduce((a, c) => a + Math.abs(c.close - c.open) / Math.max(c.high - c.low, 0.1), 0) / 3;
+
+  // Score each direction (max 5 points each)
+  let up = 0, dn = 0;
+  if (momentum > 0.4)  up++; else if (momentum < -0.4) dn++;
+  if (bullCount >= 6)  up++; else if (bearCount >= 6)   dn++;
+  if (volUp && momentum > 0) up++; else if (volUp && momentum < 0) dn++;
+  if (rangePos > 0.55) up++; else if (rangePos < 0.45) dn++;
+  if (bodyQual > 0.3 && last3[2].close > last3[2].open) up++;
+  else if (bodyQual > 0.3 && last3[2].close < last3[2].open) dn++;
+
+  const trend = momentum > 0 ? "↑" : "↓";
+  const volStr = volUp ? "expanding" : "flat";
+
+  if (up >= 3 && up > dn) return {
+    signal: "YES", confidence: up / 5,
+    reason: `${bullCount}/10 bull · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%`,
+    up, dn,
+  };
+  if (dn >= 3 && dn > up) return {
+    signal: "NO", confidence: dn / 5,
+    reason: `${bearCount}/10 bear · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%`,
+    up, dn,
+  };
+  return {
+    signal: "WAIT", confidence: 0,
+    reason: `Mixed: ${up}↑ ${dn}↓ · bull ${bullCount}/10 · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢`,
+    up, dn,
+  };
 }
 
 // ── Kalshi price feed — REST polling every 2s (Kalshi WS blocks browser origins)
@@ -465,7 +544,15 @@ export default function App() {
   const tradeCountRef = useRef(0);
   const winCountRef = useRef(0);
 
-  // ── Fetch live markets from Polymarket Gamma API ───────────────────────────
+  // Analysis bot state
+  const [currentAnalysis, setCurrentAnalysis] = useState({ signal: "WAIT", confidence: 0, reason: "Waiting for candles…" });
+
+  // Refs for stable access inside callbacks
+  const liveYesPriceRef   = useRef(null);
+  const selectedMarketRef = useRef(null);
+  const candlesRef        = useRef([]);
+
+  // ── Fetch live markets ────────────────────────────────────────────────────
   const [dataSource, setDataSource] = useState("loading");
 
   const loadMarkets = useCallback(async () => {
@@ -523,10 +610,11 @@ export default function App() {
     handleSelectMarket(markets[0]);
   }, [markets]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Sync creds ref whenever credentials change
-  useEffect(() => {
-    creds.current = { kalshiKeyId, kalshiPrivKey };
-  }, [kalshiKeyId, kalshiPrivKey]);
+  // Sync refs
+  useEffect(() => { creds.current = { kalshiKeyId, kalshiPrivKey }; }, [kalshiKeyId, kalshiPrivKey]);
+  useEffect(() => { liveYesPriceRef.current = liveYesPrice; }, [liveYesPrice]);
+  useEffect(() => { selectedMarketRef.current = selectedMarket; }, [selectedMarket]);
+  useEffect(() => { candlesRef.current = candles; }, [candles]);
 
   // Reconnect WebSocket with auth when credentials are connected
   useEffect(() => {
@@ -676,159 +764,174 @@ export default function App() {
     }
   }, []);
 
-  // ── Quick-close evaluator with adaptive exits ──────────────────────────────
-  const evaluateEntry = useCallback((tradeId, entryPx, size, side) => {
+  // ── Close evaluator — watches real live price, places close order when ready ──
+  const evaluateEntry = useCallback((tradeId, entryPx, size, side, contracts) => {
     const startTime = Date.now();
-    // Hold time varies by strategy: recovery = shorter, aggressive = slightly longer
-    const maxHold = strategyRef.current === "recovery" ? 2400
-      : strategyRef.current === "aggressive" ? 6000 : 4800;
-    const checkInterval = 400;
+    const strat = strategyRef.current;
+    const maxHold = strat === "recovery" ? 2400 : strat === "aggressive" ? 6000 : 4800;
+    const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.12 : 0.05;
+    let closed = false;
 
     const checker = setInterval(() => {
+      if (closed) { clearInterval(checker); return; }
       const elapsed = Date.now() - startTime;
-      const strat = strategyRef.current;
-      const tickMove = (Math.random() - 0.46) * 2.2;
-      const drift = strat === "aggressive" ? -0.42 : strat === "recovery" ? -0.48 : -0.44;
-      const currentPx = entryPx + (elapsed / 1200) * (Math.random() + drift) * 1.6 + tickMove;
-      const rawPnl = (side === "YES" ? currentPx - entryPx : entryPx - currentPx) * (size / Math.max(entryPx, 1));
-      // Recovery mode: take any profit immediately; aggressive: hold for more
-      const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.12 : 0.05;
+
+      // Use real live price; fall back to slight random drift if not available yet
+      const realPx = liveYesPriceRef.current;
+      const currentPx = realPx != null ? realPx
+        : clamp(entryPx + (Math.random() - 0.5) * 1.5, 1, 99);
+
+      const rawPnl = (side === "YES" ? currentPx - entryPx : entryPx - currentPx)
+        * (size / Math.max(entryPx, 1));
       const inProfit = rawPnl > profitTarget;
-      const timeout = elapsed >= maxHold;
+      const timeout  = elapsed >= maxHold;
 
-      if (inProfit || timeout) {
-        clearInterval(checker);
-        const good = rawPnl > 0;
-        const holdMs = elapsed;
-        const reason = good
-          ? ["Spike momentum held — quick exit", "Volume follow-through confirmed", "Directional move captured"][Math.floor(Math.random() * 3)]
-          : ["Spike faded before profit", "Counter-move after entry", "Volume dried up — stopped out"][Math.floor(Math.random() * 3)];
-        const suggestion = !good ? [
-          "Tighten entry — only first tick after spike",
-          "Require 2× spike ratio before entering",
-          "Skip spikes where body < 40% of range",
-          "Wait for volume to sustain 2 candles",
-          "Reduce size when spread is wide at spike"
-        ][Math.floor(Math.random() * 5)] : null;
+      if (!inProfit && !timeout) return;
+      closed = true;
+      clearInterval(checker);
 
-        setTrades(prev => prev.map(t => t.id === tradeId ? {
-          ...t, status: "closed", pnl: rawPnl, exitPx: fmt(currentPx),
-          holdMs, evalResult: good ? "good" : "bad", reason, strategy: strat
-        } : t));
-        setTradeMarkers(prev => prev.map(m => m.id === tradeId ? { ...m, pnl: rawPnl } : m));
-        setTotalPnl(p => p + rawPnl);
+      const good = rawPnl > 0;
+      const reason = good
+        ? ["Profit target reached — closed position", "Momentum confirmed — took profit", "Strong follow-through — exited in profit"][Math.floor(Math.random() * 3)]
+        : ["Max hold time — exited at market", "Spike faded — cut position", "Counter-move — stopped out"][Math.floor(Math.random() * 3)];
+      const suggestion = !good ? [
+        "Tighten entry — only first tick after spike",
+        "Require 2× spike ratio before entering",
+        "Skip spikes where body < 40% of range",
+        "Wait for volume to sustain 2 candles",
+        "Reduce size when spread is wide at spike",
+      ][Math.floor(Math.random() * 5)] : null;
 
-        setBalance(prev => {
-          const nb = prev + rawPnl;
-          balanceRef.current = nb;
-          if (nb > peakRef.current) { peakRef.current = nb; setPeakBalance(nb); }
-          const dd = peakRef.current > 0 ? (peakRef.current - nb) / peakRef.current : 0;
-          setDrawdown(Math.round(dd * 100));
-          return nb;
-        });
-
-        // Update streak counters
-        let newConsecLosses = consecutiveLossRef.current;
-        let newConsecWins = consecutiveWinRef.current;
-        if (good) { newConsecWins++; newConsecLosses = 0; }
-        else { newConsecLosses++; newConsecWins = 0; }
-        consecutiveLossRef.current = newConsecLosses;
-        consecutiveWinRef.current = newConsecWins;
-        setConsecutiveLosses(newConsecLosses);
-        setConsecutiveWins(newConsecWins);
-        if (good) setWinCount(w => {
-          winCountRef.current = w + 1;
-          return w + 1;
-        });
-
-        tradeCountRef.current += 1;
-        adjustStrategy(balanceRef.current, winCountRef.current, tradeCountRef.current, newConsecLosses, newConsecWins);
-
-        const newScore = clamp(edgeRef.current + (good ? Math.random() * 3 : -Math.random() * 2), 25, 96);
-        setEdgeScore(Math.round(newScore));
-        setEdgeHistory(h => [...h.slice(-49), Math.round(newScore)]);
-        if (!good && suggestion) {
-          setEdgeSuggestions(s => [{ id: Date.now(), text: suggestion, time: new Date().toLocaleTimeString(), applied: false }, ...s.slice(0, 9)]);
-        }
+      // Place real close order on Kalshi
+      const market = selectedMarketRef.current;
+      const ticker = market?.id;
+      if (ticker && !ticker.startsWith("KXBTCD-T") && creds.current.kalshiKeyId) {
+        closePosition({
+          ticker,
+          side: side === "YES" ? "yes" : "no",
+          contracts: contracts || Math.max(1, Math.round(size / Math.max(entryPx / 100, 0.01))),
+          currentPriceCents: Math.round(currentPx),
+          apiKeyId: creds.current.kalshiKeyId,
+          rsaPrivateKey: creds.current.kalshiPrivKey,
+        }).then(result => {
+          setOrderLog(log => [{
+            id: tradeId,
+            time: new Date().toLocaleTimeString(),
+            ticker: ticker.slice(0, 20),
+            side, price: fmt(currentPx), size: fmt(size),
+            status: result.status,
+            message: good ? `Closed in profit ${fmtPnl(rawPnl)}` : `Closed ${fmtPnl(rawPnl)}`,
+          }, ...log.slice(0, 49)]);
+        }).catch(() => {});
       }
-    }, checkInterval);
+
+      setTrades(prev => prev.map(t => t.id === tradeId ? {
+        ...t, status: "closed", pnl: rawPnl, exitPx: fmt(currentPx),
+        holdMs: elapsed, evalResult: good ? "good" : "bad", reason, strategy: strat,
+      } : t));
+      setTradeMarkers(prev => prev.map(m => m.id === tradeId ? { ...m, pnl: rawPnl } : m));
+      setTotalPnl(p => p + rawPnl);
+
+      setBalance(prev => {
+        const nb = prev + rawPnl;
+        balanceRef.current = nb;
+        if (nb > peakRef.current) { peakRef.current = nb; setPeakBalance(nb); }
+        setDrawdown(Math.round(peakRef.current > 0 ? (peakRef.current - nb) / peakRef.current * 100 : 0));
+        return nb;
+      });
+
+      let newLosses = consecutiveLossRef.current;
+      let newWins   = consecutiveWinRef.current;
+      if (good) { newWins++; newLosses = 0; } else { newLosses++; newWins = 0; }
+      consecutiveLossRef.current = newLosses;
+      consecutiveWinRef.current  = newWins;
+      setConsecutiveLosses(newLosses);
+      setConsecutiveWins(newWins);
+      if (good) setWinCount(w => { winCountRef.current = w + 1; return w + 1; });
+      tradeCountRef.current += 1;
+      adjustStrategy(balanceRef.current, winCountRef.current, tradeCountRef.current, newLosses, newWins);
+
+      const newScore = clamp(edgeRef.current + (good ? Math.random() * 3 : -Math.random() * 2), 25, 96);
+      setEdgeScore(Math.round(newScore));
+      setEdgeHistory(h => [...h.slice(-49), Math.round(newScore)]);
+      if (!good && suggestion) {
+        setEdgeSuggestions(s => [{ id: Date.now(), text: suggestion, time: new Date().toLocaleTimeString(), applied: false }, ...s.slice(0, 9)]);
+      }
+    }, 400);
   }, [adjustStrategy]);
 
-  // Entry only fires when Volume Bot detects a confirmed spike
+  // ── Entry — gated by Analysis Bot + volume spike ───────────────────────────
   const triggerEntry = useCallback((price, candleBullish, spikeRatio) => {
     if (!entryBotOn || !selectedMarket) return;
-    // Only enter if spike is strong enough (ratio > threshold + 0.5 for extra confidence)
     if (spikeRatio < spikeThreshold + 0.1) return;
-    // Dynamic Kelly-style sizing: scales with win rate and edge score
-    // Base: 5% of balance. Scales up to 20% as win rate and edge improve.
+
+    // Analysis Bot: study price action before committing
+    const analysis = analyzePriceAction(candlesRef.current, price);
+    const desiredSide = candleBullish ? "YES" : "NO";
+    const analysisAgrees = analysis.signal === desiredSide;
+    // Require analysis confirmation unless analysis says WAIT (neutral)
+    if (analysis.signal !== "WAIT" && !analysisAgrees) {
+      setCurrentAnalysis({ ...analysis, blocked: true });
+      return; // analysis disagrees — skip this spike
+    }
+    setCurrentAnalysis({ ...analysis, blocked: false });
+
     const wr = tradeCountRef.current >= 3 ? winCountRef.current / tradeCountRef.current : 0.5;
-    const edgeBonus = clamp((edgeRef.current - 50) / 50, 0, 1); // 0 at edge=50, 1 at edge=100
-    const wrBonus = clamp((wr - 0.4) / 0.4, 0, 1);              // 0 at 40% WR, 1 at 80%+ WR
+    const edgeBonus = clamp((edgeRef.current - 50) / 50, 0, 1);
+    const wrBonus   = clamp((wr - 0.4) / 0.4, 0, 1);
     const stratMultiplier = strategyRef.current === "aggressive" ? 1.4
       : strategyRef.current === "recovery" ? 0.3
       : strategyRef.current === "defensive" ? 0.5 : 1.0;
-    const basePct = 0.05 + (edgeBonus * 0.08) + (wrBonus * 0.07); // 5% → up to 20%
-    const rawSize = balanceRef.current * basePct * stratMultiplier;
-    const size = Math.min(maxBet, Math.max(rawSize, 2));
-    const side = candleBullish ? "YES" : "NO";
+    const size = Math.min(maxBet, Math.max(balanceRef.current * (0.05 + edgeBonus * 0.08 + wrBonus * 0.07) * stratMultiplier, 2));
+    const contracts = Math.max(1, Math.round(size / Math.max(price / 100, 0.01)));
+    const side  = candleBullish ? "YES" : "NO";
     const label = candleBullish ? "UP ↑" : "DOWN ↓";
-    const id = Date.now();
+    const id    = Date.now();
+
     const trade = {
-      id,
-      time: new Date().toLocaleTimeString(),
-      timestamp: Date.now(),
+      id, time: new Date().toLocaleTimeString(), timestamp: Date.now(),
       market: selectedMarket.question?.slice(0, 50) + "…",
       side, label,
-      price: fmt(price),
-      size: fmt(size),
+      price: fmt(price), size: fmt(size),
       spikeRatio: fmt(spikeRatio, 2),
-      status: "open",
-      pnl: null, evalResult: null, reason: null, holdMs: null
+      contracts,
+      analysis: analysis.reason,
+      status: "open", pnl: null, evalResult: null, reason: null, holdMs: null,
     };
+
     setEntryPrice(price);
     setTrades(prev => [trade, ...prev]);
     setTradeMarkers(prev => [{ id, side, price, pnl: null }, ...prev.slice(0, 14)]);
     setTradeCount(c => c + 1);
-    if (edgeBotOn) evaluateEntry(id, price, size, side);
+    if (edgeBotOn) evaluateEntry(id, price, size, side, contracts);
 
-    // Submit live order to Kalshi
+    // Submit live open order to Kalshi
     if (creds.current.kalshiKeyId && creds.current.kalshiPrivKey) {
       const ticker = selectedMarket?.id;
       if (ticker && !ticker.startsWith("KXBTCD-T")) {
-        // Only place real orders on live Kalshi tickers (not static fallback)
         placeOrder({
-          ticker,
-          price,
-          size,
+          ticker, price, size,
           side: side === "YES" ? "yes" : "no",
-          apiKeyId:    creds.current.kalshiKeyId,
+          apiKeyId: creds.current.kalshiKeyId,
           rsaPrivateKey: creds.current.kalshiPrivKey,
         }).then(result => {
           setOrderLog(log => [{
-            id,
-            time:    new Date().toLocaleTimeString(),
-            ticker:  ticker.slice(0, 20),
-            side,
-            price:   fmt(price),
-            size:    fmt(size),
-            ...result,
+            id, time: new Date().toLocaleTimeString(),
+            ticker: ticker.slice(0, 20), side,
+            price: fmt(price), size: fmt(size), ...result,
           }, ...log.slice(0, 49)]);
         }).catch(err => {
           setOrderLog(log => [{
-            id,
-            time:    new Date().toLocaleTimeString(),
-            ticker:  ticker.slice(0, 20),
-            side, price: fmt(price), size: fmt(size),
+            id, time: new Date().toLocaleTimeString(),
+            ticker: ticker.slice(0, 20), side, price: fmt(price), size: fmt(size),
             status: "error", message: err?.message || String(err),
           }, ...log.slice(0, 49)]);
         });
       } else {
         setOrderLog(log => [{
-          id,
-          time: new Date().toLocaleTimeString(),
-          ticker: ticker || "N/A",
-          side, price: fmt(price), size: fmt(size),
-          status: "skipped", message: ticker?.startsWith("KXBTCD-T") ? "Static demo market — no live order placed" : "No market ticker available",
+          id, time: new Date().toLocaleTimeString(),
+          ticker: ticker || "N/A", side, price: fmt(price), size: fmt(size),
+          status: "skipped", message: "Static market — no live order",
         }, ...log.slice(0, 49)]);
       }
     }
@@ -898,6 +1001,8 @@ export default function App() {
             }
           }
         }
+        // Update analysis on every candle
+        setCurrentAnalysis(analyzePriceAction(updated, newClose));
         return updated;
       });
     }, 1200);
@@ -1366,6 +1471,7 @@ export default function App() {
                             {t.spikeRatio && <span style={{ color: "#f5a623", marginLeft: "6px", fontWeight: 700 }}>×{t.spikeRatio}</span>}
                             {t.holdMs && <span style={{ color: "#555", marginLeft: "6px" }}>{(t.holdMs/1000).toFixed(1)}s</span>}
                           </div>
+                          {t.analysis && <div style={{ fontSize: "9px", color: "#444", marginTop: "1px" }}>📊 {t.analysis?.slice(0, 40)}</div>}
                           {t.reason && <div style={{ fontSize: "10px", color: t.evalResult === "good" ? "#00c805" : "#f5a623", marginTop: "1px" }}>{t.evalResult === "good" ? "✅" : "⚠️"} {t.reason?.slice(0, 38)}</div>}
                           </div>
                         </div>
@@ -1379,7 +1485,7 @@ export default function App() {
                 </div>
               </Card>
 
-              {/* Edge Builder — merged into right column */}
+              {/* Edge Builder + Analysis Bot — right column */}
               <Card glow={edgeBotOn ? "#f5a623" : undefined}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -1389,8 +1495,45 @@ export default function App() {
                       <div style={{ fontSize: "11px", color: "#bbb" }}>Evaluates every entry</div>
                     </div>
                   </div>
-
                 </div>
+
+                {/* ── Analysis Bot panel ── */}
+                {(() => {
+                  const sig = currentAnalysis.signal;
+                  const col = sig === "YES" ? "#00c805" : sig === "NO" ? "#ff5000" : "#f5a623";
+                  const icon = sig === "YES" ? "↑" : sig === "NO" ? "↓" : "⏸";
+                  const label = sig === "YES" ? "BUY YES" : sig === "NO" ? "BUY NO" : "WAIT";
+                  const conf = Math.round((currentAnalysis.confidence || 0) * 100);
+                  return (
+                    <div style={{ background: "#0a0a0a", border: `1px solid ${col}33`, borderRadius: "12px", padding: "12px", marginBottom: "14px" }}>
+                      <div style={{ fontSize: "9px", color: "#555", fontWeight: 700, letterSpacing: "0.1em", marginBottom: "8px" }}>ANALYSIS BOT</div>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          <span style={{ fontSize: "20px", fontWeight: 800, color: col }}>{icon}</span>
+                          <div>
+                            <div style={{ fontWeight: 800, fontSize: "15px", color: col }}>{label}</div>
+                            <div style={{ fontSize: "10px", color: "#555" }}>{conf}% confidence</div>
+                          </div>
+                        </div>
+                        {currentAnalysis.blocked && (
+                          <span style={{ fontSize: "10px", color: "#ff5000", fontWeight: 700, padding: "2px 8px", background: "#ff500015", borderRadius: "6px" }}>BLOCKED ENTRY</span>
+                        )}
+                      </div>
+                      {/* Confidence bar */}
+                      <div style={{ background: "#1a1a1a", borderRadius: "100px", height: "3px", overflow: "hidden", marginBottom: "6px" }}>
+                        <div style={{ width: `${conf}%`, height: "100%", background: col, borderRadius: "100px", transition: "width 0.5s" }} />
+                      </div>
+                      {/* Factor breakdown */}
+                      {currentAnalysis.up != null && (
+                        <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+                          <span style={{ fontSize: "10px", color: "#00c805", fontWeight: 700 }}>↑ {currentAnalysis.up}/5</span>
+                          <span style={{ fontSize: "10px", color: "#ff5000", fontWeight: 700 }}>↓ {currentAnalysis.dn}/5</span>
+                        </div>
+                      )}
+                      <div style={{ fontSize: "10px", color: "#666", lineHeight: 1.4 }}>{currentAnalysis.reason}</div>
+                    </div>
+                  );
+                })()}
 
                 {/* Score ring */}
                 <div style={{ textAlign: "center", padding: "6px 0 12px", borderBottom: "1px solid #161616", marginBottom: "12px" }}>

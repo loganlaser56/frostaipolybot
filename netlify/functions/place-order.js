@@ -1,5 +1,4 @@
-// Netlify serverless function — places orders on Kalshi via RSA-PSS signed requests.
-// Runs server-side so it's not subject to browser CORS restrictions.
+// Netlify serverless function — places and closes orders on Kalshi via RSA-PSS signed requests.
 import crypto from "crypto";
 
 const KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2";
@@ -35,6 +34,21 @@ function kalshiHeaders(method, path, apiKeyId, pemKey) {
   };
 }
 
+async function submitOrder(orderBody, apiKeyId, rsaPrivateKey) {
+  const path = "/trade-api/v2/portfolio/orders";
+  const resp = await fetch(`${KALSHI_API}/portfolio/orders`, {
+    method: "POST",
+    headers: kalshiHeaders("POST", path, apiKeyId, rsaPrivateKey),
+    body: JSON.stringify(orderBody),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    return { ok: false, statusCode: resp.status, error: data?.detail || JSON.stringify(data) };
+  }
+  const order = data.order || data;
+  return { ok: true, orderId: order.order_id || order.id, status: order.status, result: order };
+}
+
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 200, headers: CORS, body: "" };
@@ -53,11 +67,7 @@ export const handler = async (event) => {
   const { action, apiKeyId, rsaPrivateKey } = body;
 
   if (!apiKeyId || !rsaPrivateKey) {
-    return {
-      statusCode: 400,
-      headers: CORS,
-      body: JSON.stringify({ error: "Missing apiKeyId or rsaPrivateKey" }),
-    };
+    return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "Missing apiKeyId or rsaPrivateKey" }) };
   }
 
   // ── GET BALANCE ──────────────────────────────────────────────────────────────
@@ -77,9 +87,36 @@ export const handler = async (event) => {
     }
   }
 
-  // ── PLACE ORDER ──────────────────────────────────────────────────────────────
-  const { ticker, side, yesPriceCents, contracts } = body;
+  // ── CLOSE POSITION (sell existing contracts) ─────────────────────────────────
+  if (action === "close") {
+    const { ticker, side, contracts, currentPriceCents } = body;
+    if (!ticker || !side || !contracts) {
+      return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "Missing close fields: ticker, side, contracts" }) };
+    }
+    // Sell at 2¢ below current price to ensure fill_or_kill succeeds
+    const px = Math.round(currentPriceCents || 50);
+    const sellPx = Math.max(1, side === "yes" ? px - 2 : (100 - px) - 2);
+    const orderBody = {
+      ticker,
+      side,
+      action: "sell",
+      count: Math.max(1, Math.round(contracts)),
+      time_in_force: "fill_or_kill",
+      ...(side === "yes" ? { yes_price: sellPx } : { no_price: sellPx }),
+    };
+    try {
+      const result = await submitOrder(orderBody, apiKeyId, rsaPrivateKey);
+      if (!result.ok) {
+        return { statusCode: result.statusCode, headers: CORS, body: JSON.stringify({ success: false, error: result.error }) };
+      }
+      return { statusCode: 200, headers: CORS, body: JSON.stringify({ success: true, orderId: result.orderId, status: result.status }) };
+    } catch (e) {
+      return { statusCode: 500, headers: CORS, body: JSON.stringify({ success: false, error: e?.message || String(e) }) };
+    }
+  }
 
+  // ── OPEN POSITION (buy) ──────────────────────────────────────────────────────
+  const { ticker, side, yesPriceCents, contracts } = body;
   if (!ticker || !side || yesPriceCents == null || !contracts) {
     return {
       statusCode: 400,
@@ -88,42 +125,26 @@ export const handler = async (event) => {
     };
   }
 
-  const path = "/trade-api/v2/portfolio/orders";
   const orderBody = {
     ticker,
-    side,           // "yes" or "no"
+    side,
     action: "buy",
     count: Math.max(1, Math.round(contracts)),
     time_in_force: "fill_or_kill",
-    // Price field depends on which side we're buying
     ...(side === "yes" ? { yes_price: Math.round(yesPriceCents) } : { no_price: Math.round(100 - yesPriceCents) }),
   };
 
   try {
-    const resp = await fetch(`${KALSHI_API}/portfolio/orders`, {
-      method: "POST",
-      headers: kalshiHeaders("POST", path, apiKeyId, rsaPrivateKey),
-      body: JSON.stringify(orderBody),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      return {
-        statusCode: resp.status,
-        headers: CORS,
-        body: JSON.stringify({ success: false, error: data?.detail || JSON.stringify(data) }),
-      };
+    const result = await submitOrder(orderBody, apiKeyId, rsaPrivateKey);
+    if (!result.ok) {
+      return { statusCode: result.statusCode, headers: CORS, body: JSON.stringify({ success: false, error: result.error }) };
     }
-    const order = data.order || data;
     return {
       statusCode: 200,
       headers: CORS,
-      body: JSON.stringify({ success: true, orderId: order.order_id || order.id, status: order.status, result: order }),
+      body: JSON.stringify({ success: true, orderId: result.orderId, status: result.status, result: result.result }),
     };
   } catch (e) {
-    return {
-      statusCode: 500,
-      headers: CORS,
-      body: JSON.stringify({ success: false, error: e?.message || String(e) }),
-    };
+    return { statusCode: 500, headers: CORS, body: JSON.stringify({ success: false, error: e?.message || String(e) }) };
   }
 };
