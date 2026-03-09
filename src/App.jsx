@@ -103,23 +103,28 @@ async function placeOrder({ ticker, price, size, side, apiKeyId, rsaPrivateKey }
 function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
   let ws = null;
   let alive = true;
-  let reconnectDelay = 1000;
+  let reconnectDelay = 2000;
+  let attempts = 0;
+  const MAX_ATTEMPTS = 3; // stop after 3 failures — REST polling takes over
 
   function connect() {
     if (!alive) return;
+    if (attempts >= MAX_ATTEMPTS) {
+      // Give up on WS — REST poll fallback still runs every 4s
+      onStatus("disconnected");
+      return;
+    }
+    attempts++;
     onStatus("connecting");
     try {
       ws = new WebSocket(KALSHI_WSS);
 
       ws.onopen = () => {
-        reconnectDelay = 1000;
-        // Subscribe to ticker channel for real-time price updates
         ws.send(JSON.stringify({
           id: 1,
           cmd: "subscribe",
           params: { channels: ["ticker"], market_tickers: [ticker] },
         }));
-        onStatus("connecting");
       };
 
       ws.onmessage = (e) => {
@@ -128,13 +133,12 @@ function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
           const type = msg.type;
           const d = msg.msg || msg;
 
-          if (type === "subscribed") { onStatus("live"); return; }
+          if (type === "subscribed") { attempts = 0; reconnectDelay = 2000; onStatus("live"); return; }
           if (type === "error") { onStatus("error"); return; }
 
-          // ticker update — prices are in cents (integers)
           if (type === "ticker" && d.market_ticker === ticker) {
-            const yesBid = d.yes_bid ?? d.bid ?? null;
-            const yesAsk = d.yes_ask ?? d.ask ?? null;
+            const yesBid = d.yes_bid ?? null;
+            const yesAsk = d.yes_ask ?? null;
             const lastPrice = d.price ?? d.last_price ?? null;
             if (yesAsk != null) { onPrice(yesAsk); onStatus("live"); }
             else if (yesBid != null) { onPrice(yesBid); onStatus("live"); }
@@ -147,20 +151,17 @@ function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
               });
             }
           }
-
-          // orderbook_delta (private channel if subscribed)
-          if (type === "orderbook_delta" && d.market_ticker === ticker) {
-            onStatus("live");
-          }
         } catch {}
       };
 
       ws.onerror = () => { onStatus("error"); };
       ws.onclose = () => {
-        onStatus("reconnecting");
-        if (alive) {
+        if (alive && attempts < MAX_ATTEMPTS) {
+          onStatus("reconnecting");
           setTimeout(connect, reconnectDelay);
-          reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+          reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+        } else {
+          onStatus("disconnected");
         }
       };
     } catch { onStatus("error"); }
@@ -488,7 +489,7 @@ export default function App() {
   const [totalPnl, setTotalPnl] = useState(0);
   const [winCount, setWinCount] = useState(0);
   const [tradeCount, setTradeCount] = useState(0);
-  const [balance, setBalance] = useState(50);
+  const [balance, setBalance] = useState(0);
   const [pnlTick, setPnlTick] = useState(0); // ticks every 10s to drop expired trades from window counters
 
   const timerRef = useRef(null);
@@ -506,13 +507,13 @@ export default function App() {
   const [strategyLog, setStrategyLog] = useState([]);
   const [consecutiveLosses, setConsecutiveLosses] = useState(0);
   const [consecutiveWins, setConsecutiveWins] = useState(0);
-  const [peakBalance, setPeakBalance] = useState(50);
+  const [peakBalance, setPeakBalance] = useState(0);
   const [drawdown, setDrawdown] = useState(0);
   const strategyRef = useRef("normal");
   const consecutiveLossRef = useRef(0);
   const consecutiveWinRef = useRef(0);
-  const balanceRef = useRef(50);
-  const peakRef = useRef(50);
+  const balanceRef = useRef(0);
+  const peakRef = useRef(0);
   const tradeCountRef = useRef(0);
   const winCountRef = useRef(0);
 
