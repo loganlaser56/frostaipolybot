@@ -613,6 +613,13 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  // Fast tick every 400ms to animate the active-trade banner
+  const [tradeTick, setTradeTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTradeTick(v => v + 1), 400);
+    return () => clearInterval(t);
+  }, []);
+
   // ── Adaptive strategy adjuster ────────────────────────────────────────────
   const adjustStrategy = useCallback((newBalance, newWinCount, newTradeCount, newConsecLosses, newConsecWins) => {
     const wr = newTradeCount >= 3 ? newWinCount / newTradeCount : 0.5;
@@ -1184,6 +1191,96 @@ export default function App() {
         {/* ══ HOME ═════════════════════════════════════════════════════════ */}
         {tab === "Home" && (
           <div style={{ display: "flex", flexDirection: "column", gap: "16px", animation: "fadeUp 0.3s ease" }}>
+
+            {/* ── ACTIVE TRADE BANNER ── */}
+            {(() => {
+              void tradeTick; // force re-render every 400ms
+              const openTrade = trades.find(t => t.status === "open");
+              if (!openTrade) return null;
+              const now = Date.now();
+              const elapsed = (now - openTrade.timestamp) / 1000;
+              const strat = strategy;
+              const maxHold = strat === "recovery" ? 2.4 : strat === "aggressive" ? 6.0 : 4.8;
+              const progress = Math.min(elapsed / maxHold, 1);
+              const entryPx = parseFloat(openTrade.price);
+              const currentPx = liveYesPrice || entryPx;
+              const size = parseFloat(openTrade.size);
+              const priceDelta = openTrade.side === "YES" ? currentPx - entryPx : entryPx - currentPx;
+              const unrealized = priceDelta * (size / Math.max(entryPx, 1));
+              const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.12 : 0.05;
+              const winning = unrealized > 0;
+              const accentColor = winning ? "#00c805" : "#ff5000";
+
+              let thinking;
+              if (unrealized > profitTarget) thinking = "Profit target hit — closing position now";
+              else if (progress >= 0.9) thinking = "Max hold time reached — exiting trade";
+              else if (progress > 0.65 && winning) thinking = `Holding profit ${fmtPnl(unrealized)} — watching for exit`;
+              else if (progress > 0.65) thinking = "Past mid-hold, momentum fading — preparing exit";
+              else if (winning) thinking = `Spike follow-through confirmed — riding ${fmtPnl(unrealized)} gain`;
+              else thinking = "Monitoring spike momentum · Waiting for price follow-through";
+
+              const stratLabels = { normal: "NORMAL", defensive: "DEFENSIVE 🛡️", recovery: "RECOVERY 🔄", aggressive: "AGGRESSIVE 🚀" };
+
+              return (
+                <div style={{
+                  background: winning ? "#001500" : "#150000",
+                  border: `2px solid ${accentColor}44`,
+                  borderRadius: "18px", padding: "14px 18px",
+                  position: "relative", overflow: "hidden",
+                }}>
+                  {/* animated top edge */}
+                  <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: "2px", background: `linear-gradient(90deg,transparent,${accentColor},transparent)`, animation: "pulseGlow 1.4s ease infinite" }} />
+
+                  {/* Row 1: status + position + P&L */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                        <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#ff5000", display: "inline-block", animation: "pulseGlow 0.7s ease infinite" }} />
+                        <span style={{ fontSize: "11px", fontWeight: 800, color: "#ff5000", letterSpacing: "0.1em" }}>IN TRADE</span>
+                      </div>
+                      <span style={{ padding: "3px 14px", borderRadius: "100px", fontSize: "13px", fontWeight: 800, background: `${accentColor}20`, color: accentColor, border: `1px solid ${accentColor}44` }}>
+                        {openTrade.side === "YES" ? "↑ YES — BTC UP" : "↓ NO — BTC DOWN"}
+                      </span>
+                      <span style={{ fontSize: "11px", color: "#555" }}>
+                        entered {openTrade.price}¢ · ${openTrade.size} · ×{openTrade.spikeRatio} spike · {stratLabels[strat]}
+                      </span>
+                    </div>
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
+                      <div style={{ fontSize: "24px", fontWeight: 800, color: accentColor, lineHeight: 1 }}>{fmtPnl(unrealized)}</div>
+                      <div style={{ fontSize: "10px", color: "#555", marginTop: "1px" }}>unrealized · {elapsed.toFixed(1)}s</div>
+                    </div>
+                  </div>
+
+                  {/* Row 2: hold-time progress bar */}
+                  <div style={{ marginBottom: "10px" }}>
+                    <div style={{ background: "#1a1a1a", borderRadius: "100px", height: "5px", overflow: "hidden" }}>
+                      <div style={{
+                        width: `${progress * 100}%`, height: "100%", borderRadius: "100px",
+                        background: progress > 0.85
+                          ? "linear-gradient(90deg,#f5a623,#ff5000)"
+                          : winning ? "linear-gradient(90deg,#00c805,#00ff88)" : "linear-gradient(90deg,#ff5000,#f5a623)",
+                        transition: "width 0.4s linear",
+                      }} />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: "3px" }}>
+                      <span style={{ fontSize: "9px", color: "#444" }}>0s</span>
+                      <span style={{ fontSize: "9px", color: progress > 0.85 ? "#f5a623" : "#444" }}>{maxHold}s max hold</span>
+                    </div>
+                  </div>
+
+                  {/* Row 3: thinking */}
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "14px" }}>💭</span>
+                    <span style={{ fontSize: "12px", color: "#bbb", flex: 1 }}>{thinking}</span>
+                    {liveYesPrice && (
+                      <span style={{ fontSize: "10px", color: "#444", flexShrink: 0 }}>
+                        live {fmt(liveYesPrice, 1)}¢ · Δ {priceDelta >= 0 ? "+" : ""}{fmt(priceDelta, 1)}¢
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* ── ROW 1: Entry Bot + Edge Builder (full width, top) ── */}
             <div style={{ display: "grid", gridTemplateColumns: "3fr 2fr", gap: "16px" }}>
