@@ -656,7 +656,6 @@ export default function App() {
     setCandles(arr);
     setTradeMarkers([]);
     setEntryPrice(null);
-    setVolAlerts([]);
     liveVolBuffer.current = [];
     lastCandleTime.current = Date.now();
 
@@ -758,7 +757,6 @@ export default function App() {
         ? `${newConsecLosses} consecutive losses — entering RECOVERY mode`
         : dd > 0.2 ? `${(dd*100).toFixed(0)}% drawdown — entering RECOVERY mode`
         : `Win rate ${(wr*100).toFixed(0)}% — entering RECOVERY mode`;
-      setSpikeThreshold(t => Math.min(t + 0.4, 3.0));
       setMaxBet(b => Math.max(b * 0.4, 10));
     } else if (newConsecLosses >= 2 || (newTradeCount >= 4 && wr < 0.4)) {
       // Struggling — switch to defensive: raise threshold, cut bet size
@@ -766,19 +764,16 @@ export default function App() {
       reason = newConsecLosses >= 2
         ? `${newConsecLosses} losses in a row — switching to DEFENSIVE`
         : `Win rate ${(wr*100).toFixed(0)}% — switching to DEFENSIVE`;
-      setSpikeThreshold(t => Math.min(t + 0.2, 2.8));
       setMaxBet(b => Math.max(b * 0.65, 15));
     } else if (newConsecWins >= 3 && wr >= 0.6) {
       // Hot streak — go aggressive: lower threshold slightly, increase bet
       next = "aggressive";
       reason = `${newConsecWins} wins in a row (${(wr*100).toFixed(0)}% WR) — going AGGRESSIVE`;
-      setSpikeThreshold(t => Math.max(t - 0.2, 2.0));
       setMaxBet(b => Math.min(b * 1.3, 1000));
     } else if (newConsecWins >= 1 && prev !== "normal" && wr >= 0.5) {
       // Recovering back to normal
       next = "normal";
       reason = `Win rate recovering (${(wr*100).toFixed(0)}%) — back to NORMAL strategy`;
-      setSpikeThreshold(1.8);
       setMaxBet(b => Math.min(b * 1.1, 500));
     }
 
