@@ -35,69 +35,32 @@ const STATIC_MARKETS = [
 const KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2";
 const KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 
-// Fetch with CORS proxy fallback (Kalshi REST is public for market data)
-async function proxyFetch(url, opts = {}) {
-  try {
-    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(5000) });
-    if (r.ok) return r;
-  } catch {}
-  const proxied = [
-    `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  ];
-  for (const p of proxied) {
-    try {
-      const r = await fetch(p, { signal: AbortSignal.timeout(6000) });
-      if (r.ok) return r;
-    } catch {}
-  }
-  return null;
-}
-
-// ── Market discovery (Kalshi markets API) ─────────────────────────────────────
+// ── Market discovery — routed through Netlify function to avoid CORS ──────────
 async function fetchMarkets(limit = 20) {
   try {
-    // Fetch open BTC markets — series_ticker=KXBTC covers BTC price markets
-    const r = await proxyFetch(
-      `${KALSHI_API}/markets?series_ticker=KXBTC&status=open&limit=${limit}`
-    );
-    if (r) {
-      const data = await r.json();
-      const list = data.markets || data;
-      if (Array.isArray(list) && list.length > 0) {
-        return list.map(m => ({
-          id:           m.ticker,
-          question:     m.title || m.subtitle || m.ticker,
-          yesPrice:     m.yes_ask ?? m.yes_bid ?? 50,   // cents (0–99)
-          noPrice:      m.no_ask  ?? m.no_bid  ?? 50,
-          volume:       m.volume || 0,
-          openInterest: m.open_interest || 0,
-          endDate:      m.close_time || m.expiration_time || null,
-          active:       m.status === "open",
-          asset:        "BTC",
-        }));
+    const resp = await fetch(`/.netlify/functions/kalshi-data?type=markets&limit=${limit}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.success && Array.isArray(data.markets) && data.markets.length > 0) {
+        return data.markets;
       }
     }
   } catch {}
   return STATIC_MARKETS.slice(0, limit);
 }
 
-// ── GET single market price (REST polling fallback) ────────────────────────────
+// ── GET single market price — routed through Netlify function ─────────────────
 async function pollKalshiPrice(ticker, onPrice, onVol, onBook) {
   try {
-    const r = await proxyFetch(`${KALSHI_API}/markets/${encodeURIComponent(ticker)}`);
-    if (r) {
-      const data = await r.json();
-      const m = data.market || data;
-      const yesBid = m.yes_bid ?? null;
-      const yesAsk = m.yes_ask ?? null;
-      if (yesBid != null && yesAsk != null) {
-        const mid = (yesBid + yesAsk) / 2;
-        onPrice(mid);
-        onVol(m.volume || 0);
+    const resp = await fetch(`/.netlify/functions/kalshi-data?type=price&ticker=${encodeURIComponent(ticker)}`);
+    if (resp.ok) {
+      const d = await resp.json();
+      if (d.success && d.yes_bid != null && d.yes_ask != null) {
+        onPrice((d.yes_bid + d.yes_ask) / 2);
+        onVol(d.volume || 0);
         onBook({
-          bids: [{ price: yesBid / 100, size: m.open_interest || 0 }],
-          asks: [{ price: yesAsk / 100, size: m.open_interest || 0 }],
+          bids: [{ price: d.yes_bid / 100, size: d.open_interest || 0 }],
+          asks: [{ price: d.yes_ask / 100, size: d.open_interest || 0 }],
         });
       }
     }
