@@ -1,6 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Wallet } from "ethers";
-import { ClobClient, OrderType as ClobOrderType, Side as ClobSide, SignatureType } from "@polymarket/clob-client";
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function fmt(n, d = 2) { return isNaN(n) ? "0.00" : Number(n).toFixed(d); }
@@ -17,36 +15,32 @@ function genCandle(prev) {
   return { open: prev, close, high: Math.max(prev, close) + Math.random() * 1.2, low: Math.min(prev, close) - Math.random() * 1.2, vol: Math.random() * 90 + 20 };
 }
 
-// ─── POLYMARKET API ───────────────────────────────────────────────────────────
-// BTC & ETH short-term Polymarket markets (5-10 min style intraday candle markets)
-// Prices reflect real Polymarket YES probabilities as of March 2026
+// ─── KALSHI API ───────────────────────────────────────────────────────────────
+// Static BTC markets — used as fallback when live Kalshi API is unreachable
+// Prices in cents (50 = 50%). Tickers follow Kalshi naming conventions.
 const STATIC_MARKETS = [
-  { id: "btc-5m-1",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:05 PM ET?",  active: true, closed: false, outcomePrices: "[0.51,0.49]", outcomes: '["Yes","No"]', volume: 412000, liquidity: 148000, endDate: new Date(Date.now() + 1*5*60000).toISOString() },
-  { id: "btc-5m-2",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:10 PM ET?",  active: true, closed: false, outcomePrices: "[0.50,0.50]", outcomes: '["Yes","No"]', volume: 389000, liquidity: 137000, endDate: new Date(Date.now() + 2*5*60000).toISOString() },
-  { id: "btc-5m-3",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:15 PM ET?",  active: true, closed: false, outcomePrices: "[0.51,0.49]", outcomes: '["Yes","No"]', volume: 374000, liquidity: 131000, endDate: new Date(Date.now() + 3*5*60000).toISOString() },
-  { id: "btc-5m-4",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:20 PM ET?",  active: true, closed: false, outcomePrices: "[0.49,0.51]", outcomes: '["Yes","No"]', volume: 401000, liquidity: 143000, endDate: new Date(Date.now() + 4*5*60000).toISOString() },
-  { id: "btc-5m-5",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:25 PM ET?",  active: true, closed: false, outcomePrices: "[0.50,0.50]", outcomes: '["Yes","No"]', volume: 356000, liquidity: 124000, endDate: new Date(Date.now() + 5*5*60000).toISOString() },
-  { id: "btc-5m-6",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:30 PM ET?",  active: true, closed: false, outcomePrices: "[0.51,0.49]", outcomes: '["Yes","No"]', volume: 418000, liquidity: 151000, endDate: new Date(Date.now() + 6*5*60000).toISOString() },
-  { id: "btc-5m-7",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:35 PM ET?",  active: true, closed: false, outcomePrices: "[0.50,0.50]", outcomes: '["Yes","No"]', volume: 367000, liquidity: 128000, endDate: new Date(Date.now() + 7*5*60000).toISOString() },
-  { id: "btc-5m-8",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:40 PM ET?",  active: true, closed: false, outcomePrices: "[0.49,0.51]", outcomes: '["Yes","No"]', volume: 392000, liquidity: 139000, endDate: new Date(Date.now() + 8*5*60000).toISOString() },
-  { id: "btc-5m-9",  asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:45 PM ET?",  active: true, closed: false, outcomePrices: "[0.51,0.49]", outcomes: '["Yes","No"]', volume: 408000, liquidity: 145000, endDate: new Date(Date.now() + 9*5*60000).toISOString() },
-  { id: "btc-5m-10", asset: "BTC", interval: "5m", type: "updown", question: "Will BTC close UP on the 5-min candle ending 2:50 PM ET?",  active: true, closed: false, outcomePrices: "[0.50,0.50]", outcomes: '["Yes","No"]', volume: 381000, liquidity: 134000, endDate: new Date(Date.now() + 10*5*60000).toISOString() },
+  { id: "KXBTCD-T1",  asset: "BTC", question: "Bitcoin above $85,000 today?",           yesPrice: 52, noPrice: 48, volume: 412000, openInterest: 148000, endDate: new Date(Date.now() + 1*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T2",  asset: "BTC", question: "Bitcoin above $90,000 this week?",        yesPrice: 38, noPrice: 62, volume: 389000, openInterest: 137000, endDate: new Date(Date.now() + 2*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T3",  asset: "BTC", question: "Bitcoin below $80,000 this week?",        yesPrice: 28, noPrice: 72, volume: 374000, openInterest: 131000, endDate: new Date(Date.now() + 3*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T4",  asset: "BTC", question: "Bitcoin above $88,000 by end of day?",    yesPrice: 44, noPrice: 56, volume: 401000, openInterest: 143000, endDate: new Date(Date.now() + 4*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T5",  asset: "BTC", question: "Bitcoin between $82K–$88K at close?",     yesPrice: 61, noPrice: 39, volume: 356000, openInterest: 124000, endDate: new Date(Date.now() + 5*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T6",  asset: "BTC", question: "Bitcoin above $95,000 this month?",       yesPrice: 22, noPrice: 78, volume: 418000, openInterest: 151000, endDate: new Date(Date.now() + 6*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T7",  asset: "BTC", question: "Bitcoin hits new all-time high this week?",yesPrice: 35, noPrice: 65, volume: 367000, openInterest: 128000, endDate: new Date(Date.now() + 7*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T8",  asset: "BTC", question: "Bitcoin above $87,000 at 4 PM ET today?", yesPrice: 49, noPrice: 51, volume: 392000, openInterest: 139000, endDate: new Date(Date.now() + 8*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T9",  asset: "BTC", question: "Bitcoin drops below $82,000 today?",      yesPrice: 18, noPrice: 82, volume: 408000, openInterest: 145000, endDate: new Date(Date.now() + 9*60*60000).toISOString(), active: true },
+  { id: "KXBTCD-T10", asset: "BTC", question: "Bitcoin closes above $86,000 today?",     yesPrice: 55, noPrice: 45, volume: 381000, openInterest: 134000, endDate: new Date(Date.now() + 10*60*60000).toISOString(), active: true },
 ];
 
-// ─── POLYMARKET LIVE API LAYER ────────────────────────────────────────────────
-const GAMMA  = "https://gamma-api.polymarket.com";
-const CLOB   = "https://clob.polymarket.com";
-const DATA   = "https://data-api.polymarket.com";
-const WSS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+// ─── KALSHI LIVE API LAYER ────────────────────────────────────────────────────
+const KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2";
+const KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 
-// CORS proxy fallback for sandbox environments
+// Fetch with CORS proxy fallback (Kalshi REST is public for market data)
 async function proxyFetch(url, opts = {}) {
-  // Try direct first (works when deployed)
   try {
     const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(5000) });
     if (r.ok) return r;
   } catch {}
-  // Fallback via CORS proxies
   const proxied = [
     `https://corsproxy.io/?${encodeURIComponent(url)}`,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
@@ -60,172 +54,135 @@ async function proxyFetch(url, opts = {}) {
   return null;
 }
 
-// ── Market discovery (Gamma API) ──────────────────────────────────────────────
-async function fetchMarkets(limit = 30) {
+// ── Market discovery (Kalshi markets API) ─────────────────────────────────────
+async function fetchMarkets(limit = 20) {
   try {
-    // Note: slug=btc returns [] — use tag=crypto and filter by question text
+    // Fetch open BTC markets — series_ticker=KXBTC covers BTC price markets
     const r = await proxyFetch(
-      `${GAMMA}/markets?active=true&closed=false&limit=${limit}&tag=crypto`
+      `${KALSHI_API}/markets?series_ticker=KXBTC&status=open&limit=${limit}`
     );
     if (r) {
-      const text = await r.text();
-      // Handle both plain array and wrapped object responses
-      let data = null;
-      try { data = JSON.parse(text); } catch {}
-      if (!Array.isArray(data)) {
-        const match = text.match(/\[[\s\S]*\]/);
-        if (match) try { data = JSON.parse(match[0]); } catch {}
-      }
-      if (Array.isArray(data) && data.length > 0) {
-        const q = s => s?.toLowerCase() || "";
-        const btc = data.filter(m =>
-          q(m.question).includes("btc") || q(m.question).includes("bitcoin")
-        );
-        return btc.length > 0 ? btc : data;
+      const data = await r.json();
+      const list = data.markets || data;
+      if (Array.isArray(list) && list.length > 0) {
+        return list.map(m => ({
+          id:           m.ticker,
+          question:     m.title || m.subtitle || m.ticker,
+          yesPrice:     m.yes_ask ?? m.yes_bid ?? 50,   // cents (0–99)
+          noPrice:      m.no_ask  ?? m.no_bid  ?? 50,
+          volume:       m.volume || 0,
+          openInterest: m.open_interest || 0,
+          endDate:      m.close_time || m.expiration_time || null,
+          active:       m.status === "open",
+          asset:        "BTC",
+        }));
       }
     }
   } catch {}
   return STATIC_MARKETS.slice(0, limit);
 }
 
-// ── Live price from CLOB (public, no auth needed) ─────────────────────────────
-async function fetchLivePrice(tokenId) {
+// ── GET single market price (REST polling fallback) ────────────────────────────
+async function pollKalshiPrice(ticker, onPrice, onVol, onBook) {
   try {
-    const r = await proxyFetch(`${CLOB}/price?token_id=${tokenId}&side=BUY`);
+    const r = await proxyFetch(`${KALSHI_API}/markets/${encodeURIComponent(ticker)}`);
     if (r) {
-      const d = await r.json();
-      return parseFloat(d.price) * 100; // convert to cents
+      const data = await r.json();
+      const m = data.market || data;
+      const yesBid = m.yes_bid ?? null;
+      const yesAsk = m.yes_ask ?? null;
+      if (yesBid != null && yesAsk != null) {
+        const mid = (yesBid + yesAsk) / 2;
+        onPrice(mid);
+        onVol(m.volume || 0);
+        onBook({
+          bids: [{ price: yesBid / 100, size: m.open_interest || 0 }],
+          asks: [{ price: yesAsk / 100, size: m.open_interest || 0 }],
+        });
+      }
     }
   } catch {}
-  return null;
 }
 
-// ── Order book depth ──────────────────────────────────────────────────────────
-async function fetchOrderBook(tokenId) {
-  try {
-    const r = await proxyFetch(`${CLOB}/book?token_id=${tokenId}`);
-    if (r) return r.json();
-  } catch {}
-  return null;
-}
-
-// ── User positions (requires API key) ────────────────────────────────────────
-async function fetchPositions(apiKey) {
-  try {
-    const r = await fetch(`${DATA}/positions`, {
-      headers: { "Authorization": `Bearer ${apiKey}` }
-    });
-    if (r.ok) return r.json();
-  } catch {}
-  return null;
-}
-
-// ── Place order via official @polymarket/clob-client ─────────────────────────
-async function placeOrder({ tokenId, price, size, side, apiKey, apiSecret, apiPassphrase, privateKey, funderAddress }) {
-  if (!privateKey || !apiKey) {
-    return { status: "paper", message: "Paper trade (connect wallet for live execution)" };
+// ── Place order via Netlify Function (RSA-PSS signing runs server-side) ────────
+async function placeOrder({ ticker, price, size, side, apiKeyId, rsaPrivateKey }) {
+  if (!apiKeyId || !rsaPrivateKey) {
+    return { status: "paper", message: "Paper trade (connect Kalshi account for live execution)" };
   }
   try {
-    // ethers v6 renamed _signTypedData → signTypedData; clob-client checks for the v5 name
-    const _w = new Wallet(privateKey);
-    const signer = { _signTypedData: _w.signTypedData.bind(_w), getAddress: _w.getAddress.bind(_w) };
-    const sigType = funderAddress ? SignatureType.POLY_PROXY : SignatureType.EOA;
-    const client = new ClobClient(
-      "https://clob.polymarket.com",
-      137, // Polygon mainnet
-      signer,
-      { key: apiKey, secret: apiSecret, passphrase: apiPassphrase },
-      sigType,
-      funderAddress || undefined
-    );
-    const priceDecimal = price / 100;
-    // Convert USD size → outcome token units (size / price = tokens)
-    const tokenSize = parseFloat((size / priceDecimal).toFixed(2));
-    const result = await client.createAndPostMarketOrder(
-      { tokenID: tokenId, price: priceDecimal, size: tokenSize, side },
-      undefined,
-      ClobOrderType.FOK
-    );
-    return { status: result?.success ? "filled" : "rejected", ...(result || {}) };
+    const yesPriceCents = Math.round(price);
+    const contracts = Math.max(1, Math.round(size / (price / 100)));
+    const resp = await fetch("/.netlify/functions/place-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker, side, yesPriceCents, contracts, apiKeyId, rsaPrivateKey }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return { status: "error", message: data.error || `HTTP ${resp.status}` };
+    return { status: data.success ? "filled" : "rejected", orderId: data.orderId, orderStatus: data.status, message: data.error };
   } catch (e) {
     return { status: "error", message: e?.message || String(e) };
   }
 }
 
-// ── Polymarket CLOB WebSocket — real YES price + order book volume ────────────
-// Polymarket market channel pushes: book updates, last trade price, volume
-function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
+// ── Kalshi WebSocket — real-time YES price feed ────────────────────────────────
+function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
   let ws = null;
   let alive = true;
   let reconnectDelay = 1000;
-  let pingTimer = null;
 
   function connect() {
     if (!alive) return;
     onStatus("connecting");
     try {
-      ws = new WebSocket(WSS);
+      ws = new WebSocket(KALSHI_WSS);
 
       ws.onopen = () => {
         reconnectDelay = 1000;
-        // Correct Polymarket CLOB WS subscription format
+        // Subscribe to ticker channel for real-time price updates
         ws.send(JSON.stringify({
-          assets_ids: [tokenId],
-          type: "market",
-          custom_feature_enabled: true
+          id: 1,
+          cmd: "subscribe",
+          params: { channels: ["ticker"], market_tickers: [ticker] },
         }));
-        // Heartbeat — server drops connection without a PING every ~10s
-        pingTimer = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send("PING");
-        }, 10_000);
+        onStatus("connecting");
       };
 
       ws.onmessage = (e) => {
-        if (e.data === "PONG") return;
         try {
-          const msgs = JSON.parse(e.data);
-          const list = Array.isArray(msgs) ? msgs : [msgs];
+          const msg = JSON.parse(e.data);
+          const type = msg.type;
+          const d = msg.msg || msg;
 
-          for (const msg of list) {
-            const et = msg.event_type;
+          if (type === "subscribed") { onStatus("live"); return; }
+          if (type === "error") { onStatus("error"); return; }
 
-            // Last trade price
-            if (et === "last_trade_price" && msg.price) {
-              const px = parseFloat(msg.price) * 100;
-              if (!isNaN(px) && px > 0) { onPrice(px); onStatus("live"); }
+          // ticker update — prices are in cents (integers)
+          if (type === "ticker" && d.market_ticker === ticker) {
+            const yesBid = d.yes_bid ?? d.bid ?? null;
+            const yesAsk = d.yes_ask ?? d.ask ?? null;
+            const lastPrice = d.price ?? d.last_price ?? null;
+            if (yesAsk != null) { onPrice(yesAsk); onStatus("live"); }
+            else if (yesBid != null) { onPrice(yesBid); onStatus("live"); }
+            else if (lastPrice != null) { onPrice(lastPrice); onStatus("live"); }
+            if (d.volume != null) onVol(d.volume);
+            if (yesBid != null && yesAsk != null) {
+              onBook({
+                bids: [{ price: yesBid / 100, size: d.open_interest || 0 }],
+                asks: [{ price: yesAsk / 100, size: d.open_interest || 0 }],
+              });
             }
+          }
 
-            // Full order book snapshot
-            if (et === "book" && msg.bids && msg.asks) {
-              const bestBid = msg.bids?.[0]?.price;
-              const bestAsk = msg.asks?.[0]?.price;
-              if (bestBid && bestAsk) {
-                const mid = (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 * 100;
-                if (!isNaN(mid) && mid > 0) { onPrice(mid); onStatus("live"); }
-                const askVol = msg.asks.slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0);
-                const bidVol = msg.bids.slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0);
-                onVol(askVol + bidVol);
-                onBook({ bids: msg.bids.slice(0, 5), asks: msg.asks.slice(0, 5) });
-              }
-            }
-
-            // Price change / best bid-ask tick
-            if ((et === "price_change" || et === "best_bid_ask") && msg.best_bid && msg.best_ask) {
-              const mid = (parseFloat(msg.best_bid) + parseFloat(msg.best_ask)) / 2 * 100;
-              if (!isNaN(mid) && mid > 0) { onPrice(mid); onStatus("live"); }
-            }
-
-            // Trade fill — use as volume tick
-            if (et === "last_trade_price" && msg.size) {
-              onVol(parseFloat(msg.size));
-            }
+          // orderbook_delta (private channel if subscribed)
+          if (type === "orderbook_delta" && d.market_ticker === ticker) {
+            onStatus("live");
           }
         } catch {}
       };
 
       ws.onerror = () => { onStatus("error"); };
       ws.onclose = () => {
-        clearInterval(pingTimer);
         onStatus("reconnecting");
         if (alive) {
           setTimeout(connect, reconnectDelay);
@@ -236,43 +193,12 @@ function createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus) {
   }
 
   connect();
-  return () => { alive = false; clearInterval(pingTimer); ws?.close(); onStatus("disconnected"); };
+  return () => { alive = false; ws?.close(); onStatus("disconnected"); };
 }
 
-// ── Poll CLOB REST for latest price + orderbook (fallback when WS blocked) ────
-async function pollClobPrice(tokenId, onPrice, onVol, onBook) {
-  try {
-    // Get best bid/ask
-    const r = await proxyFetch(`${CLOB}/book?token_id=${tokenId}`);
-    if (r) {
-      const book = await r.json();
-      const bestBid = book.bids?.[0]?.price;
-      const bestAsk = book.asks?.[0]?.price;
-      if (bestBid && bestAsk) {
-        const mid = (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 * 100;
-        if (!isNaN(mid) && mid > 0) onPrice(mid);
-        const vol = [...(book.bids||[]), ...(book.asks||[])].slice(0, 10)
-          .reduce((s, x) => s + parseFloat(x.size || 0), 0);
-        onVol(vol);
-        onBook({ bids: book.bids?.slice(0,5) || [], asks: book.asks?.slice(0,5) || [] });
-      }
-    }
-  } catch {}
-}
-
-// Parse YES price from a market (outcomePrices is a JSON string array)
-function parseArr(v) {
-  if (Array.isArray(v)) return v;
-  try { return JSON.parse(v || "[]"); } catch { return []; }
-}
+// YES price in cents from a market object
 function parseYesPrice(market) {
-  try {
-    const prices = parseArr(market.outcomePrices);
-    const outcomes = parseArr(market.outcomes);
-    const yesIdx = outcomes.findIndex(o => String(o).toLowerCase() === "yes");
-    const price = yesIdx >= 0 ? parseFloat(prices[yesIdx]) : parseFloat(prices[0]);
-    return isNaN(price) ? 50 : Math.round(price * 100);
-  } catch { return 50; }
+  return market.yesPrice ?? 50;
 }
 
 // ─── UI COMPONENTS ────────────────────────────────────────────────────────────
@@ -488,11 +414,11 @@ function EdgeChart({ history }) {
 // ─── MARKET CARD ──────────────────────────────────────────────────────────────
 function MarketCard({ market, selected, onSelect }) {
   const yesPrice = parseYesPrice(market);
-  const noPrice = 100 - yesPrice;
-  const vol = parseFloat(market.volume || market.volumeNum || 0);
-  const liquidity = parseFloat(market.liquidity || market.liquidityNum || 0);
+  const noPrice = market.noPrice ?? (100 - yesPrice);
+  const vol = parseFloat(market.volume || 0);
+  const oi = parseFloat(market.openInterest || 0);
   const endDate = market.endDate ? new Date(market.endDate).toLocaleDateString() : "—";
-  const isActive = market.active && !market.closed;
+  const isActive = market.active !== false;
 
   return (
     <div onClick={() => onSelect(market)} style={{
@@ -507,17 +433,15 @@ function MarketCard({ market, selected, onSelect }) {
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: "13px", fontWeight: 600, color: "#ddd", lineHeight: 1.4, marginBottom: "10px" }}>{market.question}</div>
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            {market.asset === "BTC" && <Badge color="yellow">₿ BTC</Badge>}
-            {market.asset === "ETH" && <Badge color="blue">Ξ ETH</Badge>}
-            {market.interval && <Badge color="gray">{market.interval}</Badge>}
+            <Badge color="yellow">₿ BTC</Badge>
             <Badge color="green">YES {yesPrice}¢</Badge>
             <Badge color="red">NO {noPrice}¢</Badge>
             {vol > 0 && <Badge color="gray">Vol {fmtVol(vol)}</Badge>}
-            {liquidity > 0 && <Badge color="blue">Liq {fmtVol(liquidity)}</Badge>}
+            {oi > 0 && <Badge color="blue">OI {fmtVol(oi)}</Badge>}
           </div>
         </div>
         <div style={{ textAlign: "right", flexShrink: 0 }}>
-          <Badge color={isActive ? "green" : "gray"}>{isActive ? "Live" : "Inactive"}</Badge>
+          <Badge color={isActive ? "green" : "gray"}>{isActive ? "Open" : "Closed"}</Badge>
           <div style={{ fontSize: "11px", color: "#ddd", marginTop: "6px" }}>Ends {endDate}</div>
         </div>
       </div>
@@ -541,20 +465,13 @@ export default function App() {
   const [tab, setTab] = useState("Home");
 
   // ── Credentials & connection ─────────────────────────────────────────────
-  const [privateKey, setPrivateKey]     = useState("");
-  const [apiKey, setApiKey]             = useState("");
-  const [apiSecret, setApiSecret]       = useState("");
-  const [apiPassphrase, setApiPassphrase] = useState("");
-  const [funderAddress, setFunderAddress] = useState("");
-  const [walletType, setWalletType]     = useState("magic"); // "magic" | "metamask" | "eoa"
+  const [kalshiKeyId, setKalshiKeyId]   = useState("");       // Kalshi API Key ID
+  const [kalshiPrivKey, setKalshiPrivKey] = useState("");     // RSA private key (PEM)
   const [connected, setConnected]       = useState(false);
-  const [liveMode, setLiveMode]         = useState(false);   // false = paper, true = real orders
+  const [liveMode, setLiveMode]         = useState(false);    // false = paper, true = real orders
   const [connError, setConnError]       = useState("");
-  const [keyGenLoading, setKeyGenLoading] = useState(false);
-  const [keyGenStatus, setKeyGenStatus]   = useState(null); // { ok, msg }
-  const [positions, setPositions]       = useState([]);       // open Polymarket positions
-  const [liveBalance, setLiveBalance]   = useState(null);     // on-chain USDC balance
-  const [orderLog, setOrderLog]         = useState([]);       // CLOB order responses
+  const [liveBalance, setLiveBalance]   = useState(null);     // Kalshi balance in cents
+  const [orderLog, setOrderLog]         = useState([]);       // Kalshi order responses
   const [wsStatus, setWsStatus]         = useState("disconnected"); // ws price feed status
   const creds = useRef({});
   const liveModeRef = useRef(false);
@@ -604,7 +521,7 @@ export default function App() {
   const edgeRef = useRef(edgeScore);
   edgeRef.current = edgeScore;
 
-  // Live Polymarket data
+  // Live Kalshi market data
   const [orderBook, setOrderBook] = useState({ bids: [], asks: [] });
   const [liveYesPrice, setLiveYesPrice] = useState(null);
   const liveVolBuffer = useRef([]); // accumulates real vol ticks between candle closes
@@ -637,14 +554,12 @@ export default function App() {
       setDataSource(isStatic ? "static" : "live");
       const seen = new Set();
       const deduped = (Array.isArray(data) ? data : []).filter(m => {
-        const key = m.id || m.conditionId || m.question;
+        const key = m.id || m.question;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
       });
-      // Only keep BTC 5-min up/down markets
-      const btc5m = deduped.filter(m => m.asset === "BTC" && m.interval === "5m");
-      const final = btc5m.length > 0 ? btc5m : deduped;
+      const final = deduped.length > 0 ? deduped : STATIC_MARKETS;
       setMarkets(final);
       setLastFetched(new Date());
       // Always auto-select the next upcoming candle (first market)
@@ -673,39 +588,39 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  // Auto-connect WS to the first market that has a real token ID (runs once on first load)
+  // Auto-connect WS to the first market on load (runs once)
   const autoConnectedRef = useRef(false);
   useEffect(() => {
     if (autoConnectedRef.current || markets.length === 0) return;
-    const m = markets.find(mkt => {
-      try { return !!(JSON.parse(mkt.clobTokenIds || "[]")[0] || mkt.conditionId); }
-      catch { return !!mkt.conditionId; }
-    });
-    if (m) { autoConnectedRef.current = true; handleSelectMarket(m); }
+    autoConnectedRef.current = true;
+    handleSelectMarket(markets[0]);
   }, [markets]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync creds ref whenever credentials change
   useEffect(() => {
-    creds.current = { privateKey, apiKey, apiSecret, apiPassphrase, funderAddress, walletType };
-  }, [privateKey, apiKey, apiSecret, apiPassphrase, funderAddress, walletType]);
+    creds.current = { kalshiKeyId, kalshiPrivKey };
+  }, [kalshiKeyId, kalshiPrivKey]);
 
   useEffect(() => { liveModeRef.current = liveMode; }, [liveMode]);
 
-  // Fetch live positions when connected
+  // Fetch live Kalshi balance when connected
   useEffect(() => {
-    if (!connected || !apiKey) return;
+    if (!connected || !kalshiKeyId || !kalshiPrivKey) return;
     const load = async () => {
-      const pos = await fetchPositions(apiKey);
-      if (pos) setPositions(Array.isArray(pos) ? pos : pos.positions || []);
       try {
-        const r = await fetch(`${DATA}/value?apiKey=${apiKey}`);
-        if (r.ok) { const d = await r.json(); setLiveBalance(d.balance || d.value || null); }
+        const resp = await fetch("/.netlify/functions/place-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "balance", apiKeyId: kalshiKeyId, rsaPrivateKey: kalshiPrivKey }),
+        });
+        const d = await resp.json();
+        if (d.success) setLiveBalance(d.balance); // balance in cents
       } catch {}
     };
     load();
-    const t = setInterval(load, 15000);
+    const t = setInterval(load, 30000);
     return () => clearInterval(t);
-  }, [connected, apiKey]);
+  }, [connected, kalshiKeyId, kalshiPrivKey]);
 
   const priceFeedRef = useRef(null);
   const pollRef = useRef(null);
@@ -726,16 +641,9 @@ export default function App() {
     if (priceFeedRef.current) priceFeedRef.current();
     if (pollRef.current) clearInterval(pollRef.current);
 
-    // Get YES token ID — clobTokenIds can be an array or a JSON string
-    let tokenId = null;
-    try {
-      let ids = market.clobTokenIds;
-      if (typeof ids === "string") ids = JSON.parse(ids);
-      if (Array.isArray(ids) && ids[0]) tokenId = String(ids[0]);
-    } catch {}
-    if (!tokenId) tokenId = market.conditionId || market.condition_id || null;
-
-    if (!tokenId) return;
+    // Kalshi market ticker is used directly as the identifier
+    const ticker = market.id;
+    if (!ticker) return;
 
     const onPrice = (px) => {
       setLiveYesPrice(px);
@@ -756,12 +664,12 @@ export default function App() {
 
     // Try WebSocket first
     setWsStatus("connecting");
-    priceFeedRef.current = createPriceFeed(tokenId, onPrice, onVol, onBook, onStatus);
+    priceFeedRef.current = createPriceFeed(ticker, onPrice, onVol, onBook, onStatus);
 
-    // Also poll REST every 3s as reliable fallback (works even when WS is blocked by CORS)
+    // Also poll REST every 4s as reliable fallback
     pollRef.current = setInterval(() => {
-      pollClobPrice(tokenId, onPrice, onVol, onBook);
-    }, 3000);
+      pollKalshiPrice(ticker, onPrice, onVol, onBook);
+    }, 4000);
   };
 
   useEffect(() => () => {
@@ -946,33 +854,45 @@ export default function App() {
     setTradeCount(c => c + 1);
     if (edgeBotOn) evaluateEntry(id, price, size, side);
 
-    // Submit live order to Polymarket CLOB when in live mode
-    if (liveModeRef.current && creds.current.apiKey && creds.current.privateKey) {
-      const ids = Array.isArray(selectedMarket.clobTokenIds)
-        ? selectedMarket.clobTokenIds
-        : (() => { try { return JSON.parse(selectedMarket.clobTokenIds || "[]"); } catch { return []; } })();
-      const tokenId = side === "YES" ? ids[0] : ids[1]; // YES=index 0, NO=index 1
-      if (tokenId) {
+    // Submit live order to Kalshi when in live mode
+    if (liveModeRef.current && creds.current.kalshiKeyId && creds.current.kalshiPrivKey) {
+      const ticker = selectedMarket?.id;
+      if (ticker && !ticker.startsWith("KXBTCD-T")) {
+        // Only place real orders on live Kalshi tickers (not static fallback)
         placeOrder({
-          tokenId: String(tokenId),
-          price, size,
-          side: ClobSide.BUY, // always BUY the relevant token (YES or NO)
-          apiKey:        creds.current.apiKey,
-          apiSecret:     creds.current.apiSecret,
-          apiPassphrase: creds.current.apiPassphrase,
-          privateKey:    creds.current.privateKey,
-          funderAddress: creds.current.funderAddress,
+          ticker,
+          price,
+          size,
+          side: side === "YES" ? "yes" : "no",
+          apiKeyId:    creds.current.kalshiKeyId,
+          rsaPrivateKey: creds.current.kalshiPrivKey,
         }).then(result => {
           setOrderLog(log => [{
             id,
             time:    new Date().toLocaleTimeString(),
-            tokenId: String(tokenId).slice(0, 10) + "…",
+            ticker:  ticker.slice(0, 20),
             side,
             price:   fmt(price),
             size:    fmt(size),
             ...result,
           }, ...log.slice(0, 49)]);
+        }).catch(err => {
+          setOrderLog(log => [{
+            id,
+            time:    new Date().toLocaleTimeString(),
+            ticker:  ticker.slice(0, 20),
+            side, price: fmt(price), size: fmt(size),
+            status: "error", message: err?.message || String(err),
+          }, ...log.slice(0, 49)]);
         });
+      } else {
+        setOrderLog(log => [{
+          id,
+          time: new Date().toLocaleTimeString(),
+          ticker: ticker || "N/A",
+          side, price: fmt(price), size: fmt(size),
+          status: "skipped", message: ticker?.startsWith("KXBTCD-T") ? "Static demo market — no live order placed" : "No market ticker available",
+        }, ...log.slice(0, 49)]);
       }
     }
   }, [entryBotOn, edgeBotOn, maxBet, balance, selectedMarket, spikeThreshold, evaluateEntry]);
@@ -1047,35 +967,6 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [volBotOn, spikeThreshold, triggerEntry, liveYesPrice]);
 
-  // ── Generate API keys from private key via ClobClient L1 auth ────────────────
-  const generateApiKeys = async () => {
-    if (!privateKey.trim()) { setKeyGenStatus({ ok: false, msg: "Enter your private key first" }); return; }
-    setKeyGenLoading(true);
-    setKeyGenStatus(null);
-    try {
-      const _w = new Wallet(privateKey.trim());
-      const signer = { _signTypedData: _w.signTypedData.bind(_w), getAddress: _w.getAddress.bind(_w) };
-      const sigType = funderAddress ? SignatureType.POLY_PROXY : SignatureType.EOA;
-      const client = new ClobClient(
-        "https://clob.polymarket.com",
-        137,
-        signer,
-        undefined, // no creds needed — L1 auth uses the wallet directly
-        sigType,
-        funderAddress || undefined
-      );
-      const generated = await client.createOrDeriveApiKey();
-      setApiKey(generated.key);
-      setApiSecret(generated.secret);
-      setApiPassphrase(generated.passphrase);
-      setKeyGenStatus({ ok: true, msg: "Keys generated — ready to connect" });
-    } catch (e) {
-      setKeyGenStatus({ ok: false, msg: e?.message || "Failed to generate keys" });
-    } finally {
-      setKeyGenLoading(false);
-    }
-  };
-
   const anyOn = volBotOn || entryBotOn || edgeBotOn;
   const winRate = tradeCount > 0 ? Math.round((winCount / tradeCount) * 100) : 0;
   const lastPrice = candles[candles.length - 1]?.close || 50;
@@ -1114,7 +1005,7 @@ export default function App() {
         {/* Left: logo */}
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
           <div style={{ width: "30px", height: "30px", background: "linear-gradient(135deg,#00c805,#00ff88)", borderRadius: "9px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "15px", boxShadow: "0 0 14px #00c80540" }}>⚡</div>
-          <span style={{ fontWeight: 800, fontSize: "16px", letterSpacing: "-0.03em" }}>frostAIPolyBot</span>
+          <span style={{ fontWeight: 800, fontSize: "16px", letterSpacing: "-0.03em" }}>frostAIBot</span>
           {anyOn && <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 9px", borderRadius: "100px", background: "#00c80515", border: "1px solid #00c80330", fontSize: "10px", fontWeight: 700, color: "#00c805" }}>
             <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00c805", display: "inline-block", animation: "pulseGlow 1.2s ease infinite" }} /> LIVE
           </span>}
@@ -1205,9 +1096,9 @@ export default function App() {
 
             {/* ── Connection card ── */}
             <Card glow={connected ? "#00c805" : undefined}>
-              <div style={{ fontWeight: 800, fontSize: "17px", marginBottom: "2px" }}>🔑 Polymarket API Credentials</div>
+              <div style={{ fontWeight: 800, fontSize: "17px", marginBottom: "2px" }}>🔑 Kalshi API Credentials</div>
               <div style={{ fontSize: "12px", color: "#777", marginBottom: "18px" }}>
-                Enter your private key and funder address, then click <strong style={{ color: "#4488ff" }}>Generate API Keys</strong> to auto-fill the rest. Keys are stored in memory only.
+                Enter your Kalshi API Key ID and RSA private key to enable live trading. Keys are stored in memory only.
               </div>
 
               {connected ? (
@@ -1215,10 +1106,10 @@ export default function App() {
                   <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "14px", background: "#00c80510", borderRadius: "14px", border: "1px solid #00c80330", marginBottom: "14px" }}>
                     <span style={{ fontSize: "22px" }}>✅</span>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 800, color: "#00c805", fontSize: "14px" }}>Connected to Polymarket CLOB</div>
+                      <div style={{ fontWeight: 800, color: "#00c805", fontSize: "14px" }}>Connected to Kalshi</div>
                       <div style={{ fontSize: "11px", color: "#bbb", marginTop: "2px" }}>
                         {liveMode ? "🔴 LIVE orders enabled" : "📄 Paper trading mode"}
-                        {liveBalance !== null && <span style={{ marginLeft: "10px", color: "#00c805" }}>· USDC: ${fmt(liveBalance)}</span>}
+                        {liveBalance !== null && <span style={{ marginLeft: "10px", color: "#00c805" }}>· Balance: ${fmt(liveBalance / 100)}</span>}
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: "8px" }}>
@@ -1228,89 +1119,71 @@ export default function App() {
                       </BubbleBtn>
                       <BubbleBtn size="sm" active color="#ff5000" onClick={() => {
                         setConnected(false); setLiveMode(false);
-                        setPrivateKey(""); setApiKey(""); setApiSecret(""); setApiPassphrase(""); setFunderAddress("");
+                        setKalshiKeyId(""); setKalshiPrivKey("");
                         setConnError("");
                       }}>Disconnect</BubbleBtn>
                     </div>
                   </div>
-
-                  {/* Open positions */}
-                  {positions.length > 0 && (
-                    <div>
-                      <div style={{ fontSize: "10px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "8px" }}>OPEN POSITIONS</div>
-                      {positions.slice(0, 5).map((p, i) => (
-                        <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "8px 10px", background: "#0d0d0d", borderRadius: "10px", marginBottom: "5px" }}>
-                          <div style={{ fontSize: "11px", color: "#ddd", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.title || p.question || p.market}</div>
-                          <div style={{ fontSize: "11px", fontWeight: 700, color: "#00c805", marginLeft: "10px" }}>${fmt(p.size || p.value || 0)}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
                 </div>
               ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
                   {connError && <div style={{ padding: "10px 14px", background: "#ff500015", border: "1px solid #ff500033", borderRadius: "10px", fontSize: "12px", color: "#ff5000" }}>⚠️ {connError}</div>}
 
-                  {/* Wallet type selector */}
-                  <div>
-                    <div style={{ fontSize: "11px", color: "#999", fontWeight: 700, letterSpacing: "0.06em", marginBottom: "8px" }}>WALLET TYPE</div>
-                    <div style={{ display: "flex", gap: "6px" }}>
-                      {[["magic", "Email / Magic"], ["metamask", "MetaMask"], ["eoa", "EOA / Hardware"]].map(([val, label]) => (
-                        <button key={val} onClick={() => setWalletType(val)} style={{
-                          padding: "7px 14px", borderRadius: "100px", border: `1.5px solid ${walletType === val ? "#4488ff" : "#222"}`,
-                          background: walletType === val ? "#4488ff15" : "#111", color: walletType === val ? "#4488ff" : "#777",
-                          fontFamily: "inherit", fontSize: "11px", fontWeight: 700, cursor: "pointer"
-                        }}>{label}</button>
+                  {/* Setup guide */}
+                  <div style={{ padding: "12px 14px", background: "#0a0f1a", border: "1px solid #1a2a44", borderRadius: "12px" }}>
+                    <div style={{ fontSize: "10px", color: "#4488ff", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "8px" }}>HOW TO GET YOUR API KEYS</div>
+                    <ol style={{ paddingLeft: "16px", margin: 0 }}>
+                      {[
+                        "Create a free account at kalshi.com",
+                        "Go to Profile → API Keys",
+                        'Click "Create New API Key"',
+                        "Copy the API Key ID below",
+                        "Download and paste the RSA Private Key (PEM) — only shown once!",
+                      ].map((step, i) => (
+                        <li key={i} style={{ fontSize: "11px", color: "#aaa", marginBottom: "4px" }}>{step}</li>
                       ))}
-                    </div>
+                    </ol>
                   </div>
 
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
-                    {[
-                      { label: "Private Key", key: "privateKey", val: privateKey, set: setPrivateKey, ph: "0x…your wallet private key", hint: "Never share this" },
-                      { label: "Funder Address", key: "funderAddress", val: funderAddress, set: setFunderAddress, ph: "0x…your proxy wallet address", hint: "Address holding your USDC" },
-                      { label: "API Key", key: "apiKey", val: apiKey, set: setApiKey, ph: "CLOB API key", hint: "From polymarket.com/settings" },
-                      { label: "API Secret", key: "apiSecret", val: apiSecret, set: setApiSecret, ph: "CLOB API secret", hint: "" },
-                      { label: "API Passphrase", key: "apiPassphrase", val: apiPassphrase, set: setApiPassphrase, ph: "CLOB passphrase", hint: "" },
-                    ].map(f => (
-                      <div key={f.key} style={{ gridColumn: f.key === "apiPassphrase" ? "1 / -1" : undefined }}>
-                        <div style={{ fontSize: "11px", color: "#999", fontWeight: 700, marginBottom: "5px" }}>
-                          {f.label} {f.hint && <span style={{ color: "#444", fontWeight: 400 }}>— {f.hint}</span>}
-                        </div>
-                        <input type="password" placeholder={f.ph} value={f.val} onChange={e => f.set(e.target.value)}
-                          style={{ width: "100%", padding: "10px 14px", background: "#0d0d0d", border: "1.5px solid #1e1e1e", borderRadius: "10px", color: "#fff", fontFamily: "monospace", fontSize: "12px", outline: "none" }} />
-                      </div>
-                    ))}
+                  {/* API Key ID */}
+                  <div>
+                    <div style={{ fontSize: "11px", color: "#999", fontWeight: 700, marginBottom: "5px" }}>
+                      API KEY ID <span style={{ color: "#444", fontWeight: 400 }}>— from kalshi.com/account/profile</span>
+                    </div>
+                    <input
+                      type="text"
+                      placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                      value={kalshiKeyId}
+                      onChange={e => setKalshiKeyId(e.target.value)}
+                      style={{ width: "100%", padding: "10px 14px", background: "#0d0d0d", border: "1.5px solid #1e1e1e", borderRadius: "10px", color: "#fff", fontFamily: "monospace", fontSize: "12px", outline: "none" }}
+                    />
                   </div>
 
-                  {/* Generate API Keys */}
-                  <div style={{ padding: "14px 16px", background: "#0a0a0a", border: "1px solid #1e1e1e", borderRadius: "12px" }}>
-                    <div style={{ fontSize: "10px", color: "#666", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "10px" }}>STEP 2 — GENERATE API KEYS</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
-                      <BubbleBtn active={!keyGenLoading} color="#4488ff" onClick={generateApiKeys} disabled={keyGenLoading}>
-                        {keyGenLoading ? "⏳ Generating…" : "⚡ Generate API Keys"}
-                      </BubbleBtn>
-                      {keyGenStatus && (
-                        <span style={{ fontSize: "12px", fontWeight: 600, color: keyGenStatus.ok ? "#00c805" : "#ff5000" }}>
-                          {keyGenStatus.ok ? "✅ " : "⚠️ "}{keyGenStatus.msg}
-                        </span>
-                      )}
-                      {!keyGenStatus && (
-                        <span style={{ fontSize: "11px", color: "#444" }}>Signs with your private key — no password needed</span>
-                      )}
+                  {/* RSA Private Key */}
+                  <div>
+                    <div style={{ fontSize: "11px", color: "#999", fontWeight: 700, marginBottom: "5px" }}>
+                      RSA PRIVATE KEY (PEM) <span style={{ color: "#444", fontWeight: 400 }}>— only visible once when generated</span>
                     </div>
+                    <textarea
+                      placeholder={"-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"}
+                      value={kalshiPrivKey}
+                      onChange={e => setKalshiPrivKey(e.target.value)}
+                      rows={5}
+                      style={{ width: "100%", padding: "10px 14px", background: "#0d0d0d", border: "1.5px solid #1e1e1e", borderRadius: "10px", color: "#fff", fontFamily: "monospace", fontSize: "11px", outline: "none", resize: "vertical" }}
+                    />
                   </div>
 
                   {/* Connect */}
-                  <div style={{ display: "flex", gap: "10px", alignItems: "center", paddingTop: "4px" }}>
+                  <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
                     <BubbleBtn active color="#00c805" size="lg" onClick={() => {
-                      if (!apiKey.trim()) { setConnError("Generate API keys first"); return; }
+                      if (!kalshiKeyId.trim()) { setConnError("Enter your Kalshi API Key ID"); return; }
+                      if (!kalshiPrivKey.trim()) { setConnError("Enter your RSA Private Key"); return; }
                       setConnError("");
                       setConnected(true);
                     }}>
-                      Connect to Polymarket
+                      Connect to Kalshi
                     </BubbleBtn>
-                    <div style={{ fontSize: "11px", color: "#444" }}>🔒 Stored in memory only · Never transmitted except to clob.polymarket.com</div>
+                    <div style={{ fontSize: "11px", color: "#444" }}>🔒 Stored in memory only · Never logged or persisted</div>
                   </div>
                 </div>
               )}
@@ -1319,7 +1192,7 @@ export default function App() {
             {/* ── Order log ── */}
             {orderLog.length > 0 && (
               <Card>
-                <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "10px" }}>📋 CLOB Order Log</div>
+                <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "10px" }}>📋 Kalshi Order Log</div>
                 <div style={{ maxHeight: "200px", overflowY: "auto" }}>
                   {orderLog.map(o => (
                     <div key={o.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 8px", borderBottom: "1px solid #141414", fontSize: "11px" }}>
@@ -1332,7 +1205,7 @@ export default function App() {
                         <span style={{ color: o.side === "YES" ? "#00c805" : "#ff5000", fontWeight: 700 }}>{o.side}</span>
                         <span style={{ color: "#bbb" }}>${o.size} @ {o.price}¢</span>
                       </div>
-                      <div style={{ color: "#555" }}>{o.time} · {o.tokenId}</div>
+                      <div style={{ color: "#555" }}>{o.time} · {o.ticker || o.tokenId}</div>
                     </div>
                   ))}
                 </div>
@@ -1342,11 +1215,10 @@ export default function App() {
             {/* ── API Status ── */}
             <Card>
               <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "12px" }}>🌐 API Status</div>
-              <StatRow label="Gamma API" value="gamma-api.polymarket.com" />
-              <StatRow label="CLOB API" value="clob.polymarket.com" />
-              <StatRow label="Data API" value="data-api.polymarket.com" />
-              <StatRow label="WebSocket" value={wsStatus === "live" ? "🟢 Live" : wsStatus === "connecting" ? "🟡 Connecting…" : "⚫ Disconnected"} valueColor={wsStatus === "live" ? "#00c805" : wsStatus === "connecting" ? "#f5a623" : "#555"} />
-              <StatRow label="Markets loaded" value={markets.length} valueColor="#00c805" />
+              <StatRow label="REST API" value="api.elections.kalshi.com" />
+              <StatRow label="WebSocket" value={wsStatus === "live" ? "🟢 Live" : wsStatus === "connecting" ? "🟡 Connecting…" : wsStatus === "reconnecting" ? "🟠 Reconnecting…" : "⚫ Disconnected"} valueColor={wsStatus === "live" ? "#00c805" : wsStatus === "connecting" || wsStatus === "reconnecting" ? "#f5a623" : "#555"} />
+              <StatRow label="Markets loaded" value={`${markets.length} BTC markets`} valueColor="#00c805" />
+              <StatRow label="Data source" value={dataSource === "live" ? "🟢 Kalshi Live" : dataSource === "static" ? "⚫ Static fallback" : "…"} />
               <StatRow label="Last refresh" value={lastFetched?.toLocaleTimeString() || "—"} />
               <div style={{ marginTop: "12px" }}>
                 <BubbleBtn active color="#00c805" onClick={loadMarkets} disabled={marketsLoading}>{marketsLoading ? "…" : "↻ Refresh Markets"}</BubbleBtn>
@@ -1367,7 +1239,7 @@ export default function App() {
               <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "6px", color: "#ff5000" }}>⚠️ Risk Warning</div>
               <div style={{ fontSize: "12px", color: "#bbb", lineHeight: 1.7 }}>
                 Prediction market trading carries significant risk of loss. This bot is experimental software — not financial advice.
-                In LIVE mode, real USDC will be spent. Start with paper trading to verify performance. Never risk more than you can afford to lose.
+                In LIVE mode, real USD will be spent on Kalshi. Start with paper trading to verify performance. Never risk more than you can afford to lose.
               </div>
             </Card>
 
@@ -1645,7 +1517,7 @@ export default function App() {
                   style={{ width: "100%", padding: "8px 12px", background: "#0d0d0d", border: "1.5px solid #1e1e1e", borderRadius: "10px", color: "#fff", fontFamily: "inherit", fontSize: "12px", outline: "none", marginBottom: "10px" }} />
                 <div style={{ maxHeight: "380px", overflowY: "auto" }}>
                   {marketsLoading ? <Spinner /> : filteredMarkets.map(m => (
-                    <MarketCard key={m.id || m.conditionId} market={m} selected={selectedMarket?.id === m.id} onSelect={handleSelectMarket} />
+                    <MarketCard key={m.id} market={m} selected={selectedMarket?.id === m.id} onSelect={handleSelectMarket} />
                   ))}
                 </div>
               </Card>
