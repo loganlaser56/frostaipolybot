@@ -102,53 +102,39 @@ async function closePosition({ ticker, side, contracts, currentPriceCents, apiKe
   }
 }
 
-// ── Price action analysis — 3 factors, all must agree (no partial credit) ────
-// Kalshi BTC markets settle on CF Benchmarks RTI = Binance/Coinbase spot.
-// Signal only fires when Kalshi candles + BTC spot are aligned. This means
-// fewer entries but each one has clear multi-source confirmation.
-function analyzePriceAction(candles, currentPrice, btcData = null) {
-  if (candles.length < 10) return { signal: "WAIT", confidence: 0, reason: "Collecting candles…", factors: null };
+// ── Price action analysis — pure Kalshi momentum ─────────────────────────────
+// Trade in the direction the Kalshi YES price is already moving.
+// 5-candle net move sets direction; 3-candle check confirms it isn't reversing.
+function analyzePriceAction(candles, currentPrice) {
+  if (candles.length < 5) return { signal: "WAIT", confidence: 0, reason: "Collecting candles…", factors: null };
 
-  // Factor 1 — Kalshi price momentum: net move of last 5 candles
   const last5 = candles.slice(-5);
   const kalshiNet = last5[4].close - last5[0].open;
-  const kalshiDir = kalshiNet > 0.5 ? "UP" : kalshiNet < -0.5 ? "DOWN" : null;
+  const last3 = candles.slice(-3);
+  const kalshiNet3 = last3[2].close - last3[0].open;
 
-  // Factor 2 — BTC 5-min spot trend (this IS the settlement driver)
-  const c5m = btcData?.change5m ?? null;
-  const btcDir5m = c5m === null ? null : c5m > 0.08 ? "UP" : c5m < -0.08 ? "DOWN" : null;
+  const factors = { kalshiNet: kalshiNet.toFixed(1), kalshiNet3: kalshiNet3.toFixed(1) };
 
-  // Factor 3 — BTC 1-min momentum (current spot pulse — veto if reversing)
-  const c1m = btcData?.change1m ?? null;
-  const btcDir1m = c1m === null ? null : c1m > 0.03 ? "UP" : c1m < -0.03 ? "DOWN" : null;
-
-  const factors = { kalshiDir, btcDir5m, btcDir1m };
-  const hasBtc = c5m !== null;
-
-  const s5 = c5m !== null ? (c5m >= 0 ? "+" : "") + c5m.toFixed(2) + "%" : "—";
-  const s1 = c1m !== null ? (c1m >= 0 ? "+" : "") + c1m.toFixed(3) + "%" : "—";
-
-  // All available signals must agree — 1m divergence vetoes the trade
-  const yesSignal = kalshiDir === "UP"   && (!hasBtc || (btcDir5m === "UP"   && btcDir1m !== "DOWN"));
-  const noSignal  = kalshiDir === "DOWN" && (!hasBtc || (btcDir5m === "DOWN" && btcDir1m !== "UP"));
+  const yesSignal = kalshiNet > 0.8 && kalshiNet3 > -0.3 && currentPrice < 65;
+  const noSignal  = kalshiNet < -0.8 && kalshiNet3 < 0.3 && currentPrice > 35;
 
   if (yesSignal) return {
     signal: "YES", confidence: 1,
-    reason: `Kalshi +${fmt(Math.abs(kalshiNet), 1)}¢ · BTC 5m ${s5} · 1m ${s1}`,
+    reason: `Kalshi 5c +${fmt(Math.abs(kalshiNet), 1)}¢ · 3c ${fmt(kalshiNet3, 1)}¢ · YES ${fmt(currentPrice, 1)}¢`,
     factors,
   };
   if (noSignal) return {
     signal: "NO", confidence: 1,
-    reason: `Kalshi −${fmt(Math.abs(kalshiNet), 1)}¢ · BTC 5m ${s5} · 1m ${s1}`,
+    reason: `Kalshi 5c −${fmt(Math.abs(kalshiNet), 1)}¢ · 3c ${fmt(kalshiNet3, 1)}¢ · YES ${fmt(currentPrice, 1)}¢`,
     factors,
   };
 
-  // Build a specific wait reason so the user understands what's missing
   const why = [];
-  if (!kalshiDir) why.push(`Kalshi flat (${fmt(kalshiNet, 1)}¢)`);
-  else if (hasBtc && btcDir5m !== kalshiDir) why.push(`BTC 5m ${s5} disagrees`);
-  else if (hasBtc && btcDir1m && btcDir1m !== kalshiDir) why.push(`BTC 1m ${s1} reversing`);
-  else if (!hasBtc) why.push("awaiting BTC feed");
+  if (Math.abs(kalshiNet) <= 0.8) why.push(`Kalshi flat (${fmt(kalshiNet, 1)}¢ 5c move)`);
+  else if (kalshiNet > 0 && kalshiNet3 <= -0.3) why.push("3c momentum reversing");
+  else if (kalshiNet < 0 && kalshiNet3 >= 0.3)  why.push("3c momentum reversing");
+  else if (kalshiNet > 0 && currentPrice >= 65)  why.push(`YES ${fmt(currentPrice, 1)}¢ too high`);
+  else if (kalshiNet < 0 && currentPrice <= 35)  why.push(`YES ${fmt(currentPrice, 1)}¢ too low`);
 
   return {
     signal: "WAIT", confidence: 0,
@@ -902,12 +888,13 @@ export default function App() {
     }
   }, [tradeTick, adjustStrategy]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Evaluate edge on every BTC price update ──────────────────────────────
-  // Strategy: enter when BTC spot has moved meaningfully in one direction
-  // but Kalshi hasn't fully repriced yet. Hold minutes, not seconds.
+  // ── Evaluate edge on every tick — pure Kalshi momentum ───────────────────
+  // Enter when the YES price has been trending for 5 candles and hasn't
+  // reversed on the last 3. No BTC signal required.
   useEffect(() => {
     if (!botActive) return;
-    if (tradesRef.current.some(t => t.status === "open")) return;
+    // Allow up to 2 concurrent open trades
+    if (tradesRef.current.filter(t => t.status === "open").length >= 2) return;
 
     const market = selectedMarketRef.current;
     if (!market?.endDate) return;
@@ -918,24 +905,27 @@ export default function App() {
     const timeInWindow = (now - windowStart) / 1000;   // seconds
     const timeToEnd    = (endTime - now) / 1000;       // seconds
 
-    // Only trade 1–8 min into the window, with 3+ min left before settlement
-    if (timeInWindow < 60 || timeInWindow > 480 || timeToEnd < 180) return;
+    // Trade 0.5–12 min into window, with 1.5+ min left before settlement
+    if (timeInWindow < 30 || timeInWindow > 720 || timeToEnd < 90) return;
 
-    const c5m      = btcDataRef.current?.change5m ?? null;
-    const c1m      = btcDataRef.current?.change1m ?? null;
+    const candles  = candlesRef.current;
     const yesPrice = liveYesPriceRef.current;
 
-    if (yesPrice == null || c5m === null) return;
+    if (yesPrice == null || candles.length < 5) return;
 
-    // 90-second cooldown between entries — one trade per market window
-    if (now - lastEntryRef.current < 90_000) return;
+    // 30-second cooldown between entries
+    if (now - lastEntryRef.current < 30_000) return;
 
-    // Entry conditions:
-    // YES: BTC moving up (5m > 0.12%) + spot not reversing (1m > -0.05%) + Kalshi underpriced (<57¢)
-    // NO:  BTC moving dn (5m < -0.12%) + spot not reversing (1m < +0.05%) + Kalshi underpriced (>43¢)
+    // Kalshi momentum: net move of last 5 candles sets direction
+    // Short-term (last 3) must not be reversing
+    const last5 = candles.slice(-5);
+    const kalshiNet = last5[4].close - last5[0].open;
+    const last3 = candles.slice(-3);
+    const kalshiNet3 = last3[2].close - last3[0].open;
+
     let side = null;
-    if (c5m > 0.12 && (c1m === null || c1m > -0.05) && yesPrice < 57)  side = "YES";
-    else if (c5m < -0.12 && (c1m === null || c1m < 0.05) && yesPrice > 43) side = "NO";
+    if (kalshiNet > 0.8 && kalshiNet3 > -0.3 && yesPrice < 65)  side = "YES";
+    else if (kalshiNet < -0.8 && kalshiNet3 < 0.3 && yesPrice > 35) side = "NO";
 
     if (!side) return;
 
@@ -947,14 +937,14 @@ export default function App() {
     const size      = Math.min(maxBetRef.current * stratMultiplier, Math.max(balanceRef.current * 0.12, 5));
     const contracts = Math.max(1, Math.floor(size / Math.max(yesPrice / 100, 0.01)));
     const id        = now;
-    const c5mStr    = (c5m >= 0 ? "+" : "") + c5m.toFixed(3) + "%";
+    const netStr    = (kalshiNet >= 0 ? "+" : "") + fmt(Math.abs(kalshiNet), 1) + "¢";
 
     const trade = {
       id, time: new Date().toLocaleTimeString(), timestamp: id,
       market: market.question?.slice(0, 50),
       side, label: side === "YES" ? "UP ↑" : "DOWN ↓",
       price: fmt(yesPrice), size: fmt(size), contracts,
-      analysis: `BTC 5m ${c5mStr} · Kalshi ${fmt(yesPrice, 1)}¢ · min ${Math.round(timeInWindow / 60)} of 15`,
+      analysis: `Kalshi momentum ${netStr} · YES ${fmt(yesPrice, 1)}¢ · min ${Math.round(timeInWindow / 60)} of 15`,
       status: "open", pnl: null, evalResult: null, reason: null, holdMs: null,
     };
 
@@ -984,7 +974,7 @@ export default function App() {
         }, ...log.slice(0, 49)]);
       });
     }
-  }, [btcSpot, botActive]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tradeTick, botActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Candle loop — visualization only (no spike detection) ─────────────────
   useEffect(() => {
@@ -1727,8 +1717,6 @@ export default function App() {
                 <div style={{ fontWeight: 800, fontSize: "15px", marginBottom: "14px" }}>📋 Entry Conditions</div>
                 {(() => {
                   void tradeTick;
-                  const c5m = btcChange5m;
-                  const c1m = btcChange1m;
                   const yp  = liveYesPrice;
                   const market = selectedMarket;
                   const endMs = market?.endDate ? new Date(market.endDate).getTime() : null;
@@ -1736,27 +1724,30 @@ export default function App() {
                   const windowStart = endMs ? endMs - 15 * 60_000 : null;
                   const timeInWindow = windowStart ? (now - windowStart) / 1000 : null;
                   const timeToEnd = endMs ? (endMs - now) / 1000 : null;
-                  const windowOk = timeInWindow !== null && timeInWindow >= 60 && timeInWindow <= 480 && timeToEnd >= 180;
+                  const windowOk = timeInWindow !== null && timeInWindow >= 30 && timeInWindow <= 720 && timeToEnd >= 90;
                   const minuteIn = timeInWindow !== null ? Math.max(0, Math.round(timeInWindow / 60)) : null;
 
-                  const btcUp = c5m !== null && c5m > 0.12;
-                  const btcDn = c5m !== null && c5m < -0.12;
-                  const btcOk = btcUp || btcDn;
-                  const notReversing = c1m === null || (btcUp ? c1m > -0.05 : btcDn ? c1m < 0.05 : true);
-                  const pricingOk = yp !== null && ((btcUp && yp < 57) || (btcDn && yp > 43));
-                  const noOpenTrade = !tradesRef.current.some(t => t.status === "open");
-                  const allGreen = botActive && btcOk && notReversing && pricingOk && windowOk && noOpenTrade;
+                  const c = candlesRef.current;
+                  const last5 = c.length >= 5 ? c.slice(-5) : null;
+                  const last3 = c.length >= 3 ? c.slice(-3) : null;
+                  const kalshiNet  = last5 ? last5[4].close - last5[0].open : null;
+                  const kalshiNet3 = last3 ? last3[2].close - last3[0].open : null;
+                  const momentumOk = kalshiNet !== null && Math.abs(kalshiNet) > 0.8;
+                  const notReversing = kalshiNet3 !== null && (kalshiNet > 0 ? kalshiNet3 > -0.3 : kalshiNet3 < 0.3);
+                  const pricingOk = yp !== null && ((kalshiNet > 0 && yp < 65) || (kalshiNet < 0 && yp > 35));
+                  const openCount = tradesRef.current.filter(t => t.status === "open").length;
+                  const slotOk = openCount < 2;
+                  const allGreen = botActive && momentumOk && notReversing && pricingOk && windowOk && slotOk;
 
-                  const chgColor = v => v === null ? "#444" : v > 0 ? "#00c805" : v < 0 ? "#ff5000" : "#555";
                   const dot = (pass, na = false) => na ? { color: "#333", icon: "·" }
                     : pass ? { color: "#00c805", icon: "✓" } : { color: "#ff5000", icon: "✗" };
 
                   const rows = [
-                    { label: "BTC 5m momentum",  detail: c5m !== null ? `${c5m >= 0 ? "+" : ""}${c5m.toFixed(3)}%  (need >0.12%)` : "awaiting feed", ...dot(btcOk, c5m === null) },
-                    { label: "1m not reversing",  detail: c1m !== null ? `${c1m >= 0 ? "+" : ""}${c1m.toFixed(3)}%` : "no data", ...dot(notReversing, c1m === null) },
-                    { label: "Kalshi underpriced", detail: yp !== null ? `YES at ${fmt(yp, 1)}¢ (need <57 or >43)` : "no price", ...dot(pricingOk, yp === null) },
-                    { label: "Window timing",      detail: timeInWindow !== null ? `min ${minuteIn} of 15 (need 1–8, 3+ left)` : "no market", ...dot(windowOk, timeInWindow === null) },
-                    { label: "No open position",   detail: noOpenTrade ? "clear" : "already in trade", ...dot(noOpenTrade) },
+                    { label: "Kalshi 5c momentum",  detail: kalshiNet !== null ? `${kalshiNet >= 0 ? "+" : ""}${fmt(kalshiNet, 1)}¢  (need >0.8¢)` : "awaiting candles", ...dot(momentumOk, kalshiNet === null) },
+                    { label: "3c not reversing",     detail: kalshiNet3 !== null ? `${kalshiNet3 >= 0 ? "+" : ""}${fmt(kalshiNet3, 1)}¢` : "awaiting candles", ...dot(notReversing, kalshiNet3 === null) },
+                    { label: "YES price in range",   detail: yp !== null ? `YES ${fmt(yp, 1)}¢ (need <65 or >35)` : "no price", ...dot(pricingOk, yp === null) },
+                    { label: "Window timing",        detail: timeInWindow !== null ? `min ${minuteIn} of 15 (need 0.5–12, 1.5+ left)` : "no market", ...dot(windowOk, timeInWindow === null) },
+                    { label: "Trade slots open",     detail: `${openCount}/2 open`, ...dot(slotOk) },
                   ];
 
                   return (
@@ -1774,9 +1765,9 @@ export default function App() {
                         <div style={{ fontSize: "12px", fontWeight: 800, color: allGreen ? "#00c805" : "#555" }}>
                           {allGreen ? "✓ ALL CONDITIONS MET — ENTERING TRADE" : botActive ? "⏳ WATCHING — waiting for setup" : "⏸ BOT OFF"}
                         </div>
-                        {c5m !== null && (
+                        {kalshiNet !== null && (
                           <div style={{ fontSize: "10px", color: "#444", marginTop: "4px" }}>
-                            BTC 5m {c5m >= 0 ? "+" : ""}{c5m.toFixed(3)}% · 1m {c1m !== null ? (c1m >= 0 ? "+" : "") + c1m.toFixed(3) + "%" : "—"} · YES {yp ? fmt(yp, 1) + "¢" : "—"}
+                            Kalshi 5c {kalshiNet >= 0 ? "+" : ""}{fmt(kalshiNet, 1)}¢ · 3c {kalshiNet3 !== null ? (kalshiNet3 >= 0 ? "+" : "") + fmt(kalshiNet3, 1) + "¢" : "—"} · YES {yp ? fmt(yp, 1) + "¢" : "—"}
                           </div>
                         )}
                       </div>
