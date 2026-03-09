@@ -551,6 +551,8 @@ export default function App() {
   const liveYesPriceRef   = useRef(null);
   const selectedMarketRef = useRef(null);
   const candlesRef        = useRef([]);
+  const tradesRef         = useRef([]);
+  const closingTradesRef  = useRef(new Set());
 
   // ── Fetch live markets ────────────────────────────────────────────────────
   const [dataSource, setDataSource] = useState("loading");
@@ -615,6 +617,7 @@ export default function App() {
   useEffect(() => { liveYesPriceRef.current = liveYesPrice; }, [liveYesPrice]);
   useEffect(() => { selectedMarketRef.current = selectedMarket; }, [selectedMarket]);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
+  useEffect(() => { tradesRef.current = trades; }, [trades]);
 
   // Reconnect WebSocket with auth when credentials are connected
   useEffect(() => {
@@ -764,36 +767,41 @@ export default function App() {
     }
   }, []);
 
-  // ── Close evaluator — watches real live price, places close order when ready ──
-  const evaluateEntry = useCallback((tradeId, entryPx, size, side, contracts) => {
-    const startTime = Date.now();
-    const strat = strategyRef.current;
-    const maxHold = strat === "recovery" ? 2400 : strat === "aggressive" ? 6000 : 4800;
-    const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.12 : 0.05;
-    let closed = false;
+  // ── Position monitor — runs every 400ms, closes any open trade that hits target ──
+  // Always active regardless of which bots are on. Reads state via refs to avoid
+  // stale closures and does not depend on evaluateEntry or edgeBotOn.
+  useEffect(() => {
+    const openTrades = tradesRef.current.filter(t => t.status === "open");
+    if (openTrades.length === 0) return;
 
-    const checker = setInterval(() => {
-      if (closed) { clearInterval(checker); return; }
-      const elapsed = Date.now() - startTime;
+    for (const trade of openTrades) {
+      if (closingTradesRef.current.has(trade.id)) continue;
 
-      // Use real live price; fall back to slight random drift if not available yet
-      const realPx = liveYesPriceRef.current;
-      const currentPx = realPx != null ? realPx
-        : clamp(entryPx + (Math.random() - 0.5) * 1.5, 1, 99);
+      const entryPx = parseFloat(trade.price);
+      const size    = parseFloat(trade.size);
+      const elapsed = Date.now() - trade.timestamp;
+      const strat   = strategyRef.current;
+      const maxHold      = strat === "recovery" ? 4000 : strat === "aggressive" ? 10000 : 7000;
+      const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.10  : 0.05;
 
-      const rawPnl = (side === "YES" ? currentPx - entryPx : entryPx - currentPx)
+      const currentPx = liveYesPriceRef.current ?? entryPx;
+      const rawPnl = (trade.side === "YES" ? currentPx - entryPx : entryPx - currentPx)
         * (size / Math.max(entryPx, 1));
-      const inProfit = rawPnl > profitTarget;
+
+      const inProfit = rawPnl >= profitTarget;
       const timeout  = elapsed >= maxHold;
 
-      if (!inProfit && !timeout) return;
-      closed = true;
-      clearInterval(checker);
+      if (!inProfit && !timeout) continue;
+
+      // Mark as being closed immediately to prevent re-entry
+      closingTradesRef.current.add(trade.id);
 
       const good = rawPnl > 0;
-      const reason = good
-        ? ["Profit target reached — closed position", "Momentum confirmed — took profit", "Strong follow-through — exited in profit"][Math.floor(Math.random() * 3)]
-        : ["Max hold time — exited at market", "Spike faded — cut position", "Counter-move — stopped out"][Math.floor(Math.random() * 3)];
+      const reason = inProfit && good
+        ? "Profit target reached — closed position"
+        : timeout && good ? "Max hold reached — closed in profit"
+        : timeout        ? "Max hold reached — exited at market"
+        : "Spike faded — cut position";
       const suggestion = !good ? [
         "Tighten entry — only first tick after spike",
         "Require 2× spike ratio before entering",
@@ -802,34 +810,12 @@ export default function App() {
         "Reduce size when spread is wide at spike",
       ][Math.floor(Math.random() * 5)] : null;
 
-      // Place real close order on Kalshi
-      const market = selectedMarketRef.current;
-      const ticker = market?.id;
-      if (ticker && !ticker.startsWith("KXBTCD-T") && creds.current.kalshiKeyId) {
-        closePosition({
-          ticker,
-          side: side === "YES" ? "yes" : "no",
-          contracts: contracts || Math.max(1, Math.round(size / Math.max(entryPx / 100, 0.01))),
-          currentPriceCents: Math.round(currentPx),
-          apiKeyId: creds.current.kalshiKeyId,
-          rsaPrivateKey: creds.current.kalshiPrivKey,
-        }).then(result => {
-          setOrderLog(log => [{
-            id: tradeId,
-            time: new Date().toLocaleTimeString(),
-            ticker: ticker.slice(0, 20),
-            side, price: fmt(currentPx), size: fmt(size),
-            status: result.status,
-            message: good ? `Closed in profit ${fmtPnl(rawPnl)}` : `Closed ${fmtPnl(rawPnl)}`,
-          }, ...log.slice(0, 49)]);
-        }).catch(() => {});
-      }
-
-      setTrades(prev => prev.map(t => t.id === tradeId ? {
+      // Update internal trade record
+      setTrades(prev => prev.map(t => t.id === trade.id ? {
         ...t, status: "closed", pnl: rawPnl, exitPx: fmt(currentPx),
-        holdMs: elapsed, evalResult: good ? "good" : "bad", reason, strategy: strat,
+        holdMs: elapsed, evalResult: good ? "good" : "bad", reason,
       } : t));
-      setTradeMarkers(prev => prev.map(m => m.id === tradeId ? { ...m, pnl: rawPnl } : m));
+      setTradeMarkers(prev => prev.map(m => m.id === trade.id ? { ...m, pnl: rawPnl } : m));
       setTotalPnl(p => p + rawPnl);
 
       setBalance(prev => {
@@ -857,8 +843,30 @@ export default function App() {
       if (!good && suggestion) {
         setEdgeSuggestions(s => [{ id: Date.now(), text: suggestion, time: new Date().toLocaleTimeString(), applied: false }, ...s.slice(0, 9)]);
       }
-    }, 400);
-  }, [adjustStrategy]);
+
+      // Place real close order on Kalshi
+      const ticker = selectedMarketRef.current?.id;
+      if (ticker && !ticker.startsWith("KXBTCD-T") && creds.current.kalshiKeyId) {
+        closePosition({
+          ticker,
+          side: trade.side === "YES" ? "yes" : "no",
+          contracts: trade.contracts || Math.max(1, Math.round(size / Math.max(entryPx / 100, 0.01))),
+          currentPriceCents: Math.round(currentPx),
+          apiKeyId: creds.current.kalshiKeyId,
+          rsaPrivateKey: creds.current.kalshiPrivKey,
+        }).then(result => {
+          setOrderLog(log => [{
+            id: trade.id,
+            time: new Date().toLocaleTimeString(),
+            ticker: ticker.slice(0, 20),
+            side: trade.side, price: fmt(currentPx), size: fmt(size),
+            status: result.status,
+            message: `${reason} · ${fmtPnl(rawPnl)}`,
+          }, ...log.slice(0, 49)]);
+        }).catch(() => {});
+      }
+    }
+  }, [tradeTick, adjustStrategy]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Entry — gated by Analysis Bot + volume spike ───────────────────────────
   const triggerEntry = useCallback((price, candleBullish, spikeRatio) => {
@@ -903,7 +911,7 @@ export default function App() {
     setTrades(prev => [trade, ...prev]);
     setTradeMarkers(prev => [{ id, side, price, pnl: null }, ...prev.slice(0, 14)]);
     setTradeCount(c => c + 1);
-    if (edgeBotOn) evaluateEntry(id, price, size, side, contracts);
+    // Position monitor (useEffect on tradeTick) handles exit automatically
 
     // Submit live open order to Kalshi
     if (creds.current.kalshiKeyId && creds.current.kalshiPrivKey) {
@@ -935,7 +943,7 @@ export default function App() {
         }, ...log.slice(0, 49)]);
       }
     }
-  }, [entryBotOn, edgeBotOn, maxBet, balance, selectedMarket, spikeThreshold, evaluateEntry]);
+  }, [entryBotOn, maxBet, balance, selectedMarket, spikeThreshold]);
 
   // ── Volume bot loop — uses REAL Polymarket order book volume when available ──
   useEffect(() => {
