@@ -44,7 +44,6 @@ const STATIC_MARKETS = makeStaticMarkets();
 
 // ─── KALSHI LIVE API LAYER ────────────────────────────────────────────────────
 const KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2";
-const KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 
 // ── Market discovery — routed through Netlify function to avoid CORS ──────────
 async function fetchMarkets(limit = 20) {
@@ -60,28 +59,11 @@ async function fetchMarkets(limit = 20) {
   return STATIC_MARKETS.slice(0, limit);
 }
 
-// ── GET single market price — routed through Netlify function ─────────────────
-async function pollKalshiPrice(ticker, onPrice, onVol, onBook) {
-  try {
-    const resp = await fetch(`/.netlify/functions/kalshi-data?type=price&ticker=${encodeURIComponent(ticker)}`);
-    if (resp.ok) {
-      const d = await resp.json();
-      if (d.success && d.yes_bid != null && d.yes_ask != null) {
-        onPrice((d.yes_bid + d.yes_ask) / 2);
-        onVol(d.volume || 0);
-        onBook({
-          bids: [{ price: d.yes_bid / 100, size: d.open_interest || 0 }],
-          asks: [{ price: d.yes_ask / 100, size: d.open_interest || 0 }],
-        });
-      }
-    }
-  } catch {}
-}
 
 // ── Place order via Netlify Function (RSA-PSS signing runs server-side) ────────
 async function placeOrder({ ticker, price, size, side, apiKeyId, rsaPrivateKey }) {
   if (!apiKeyId || !rsaPrivateKey) {
-    return { status: "paper", message: "Paper trade (connect Kalshi account for live execution)" };
+    return { status: "skipped", message: "No credentials — connect Kalshi account in Settings" };
   }
   try {
     const yesPriceCents = Math.round(price);
@@ -99,76 +81,44 @@ async function placeOrder({ ticker, price, size, side, apiKeyId, rsaPrivateKey }
   }
 }
 
-// ── Kalshi WebSocket — real-time YES price feed ────────────────────────────────
+// ── Kalshi price feed — REST polling every 2s (Kalshi WS blocks browser origins)
 function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
-  let ws = null;
   let alive = true;
-  let reconnectDelay = 2000;
-  let attempts = 0;
-  const MAX_ATTEMPTS = 3; // stop after 3 failures — REST polling takes over
+  let failStreak = 0;
+  onStatus("connecting");
 
-  function connect() {
+  async function poll() {
     if (!alive) return;
-    if (attempts >= MAX_ATTEMPTS) {
-      // Give up on WS — REST poll fallback still runs every 4s
-      onStatus("disconnected");
-      return;
-    }
-    attempts++;
-    onStatus("connecting");
     try {
-      ws = new WebSocket(KALSHI_WSS);
-
-      ws.onopen = () => {
-        ws.send(JSON.stringify({
-          id: 1,
-          cmd: "subscribe",
-          params: { channels: ["ticker"], market_tickers: [ticker] },
-        }));
-      };
-
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          const type = msg.type;
-          const d = msg.msg || msg;
-
-          if (type === "subscribed") { attempts = 0; reconnectDelay = 2000; onStatus("live"); return; }
-          if (type === "error") { onStatus("error"); return; }
-
-          if (type === "ticker" && d.market_ticker === ticker) {
-            const yesBid = d.yes_bid ?? null;
-            const yesAsk = d.yes_ask ?? null;
-            const lastPrice = d.price ?? d.last_price ?? null;
-            if (yesAsk != null) { onPrice(yesAsk); onStatus("live"); }
-            else if (yesBid != null) { onPrice(yesBid); onStatus("live"); }
-            else if (lastPrice != null) { onPrice(lastPrice); onStatus("live"); }
-            if (d.volume != null) onVol(d.volume);
-            if (yesBid != null && yesAsk != null) {
-              onBook({
-                bids: [{ price: yesBid / 100, size: d.open_interest || 0 }],
-                asks: [{ price: yesAsk / 100, size: d.open_interest || 0 }],
-              });
-            }
-          }
-        } catch {}
-      };
-
-      ws.onerror = () => { onStatus("error"); };
-      ws.onclose = () => {
-        if (alive && attempts < MAX_ATTEMPTS) {
-          onStatus("reconnecting");
-          setTimeout(connect, reconnectDelay);
-          reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+      const resp = await fetch(
+        `/.netlify/functions/kalshi-data?type=price&ticker=${encodeURIComponent(ticker)}`
+      );
+      if (resp.ok) {
+        const d = await resp.json();
+        if (d.success && d.yes_bid != null && d.yes_ask != null) {
+          onPrice((d.yes_bid + d.yes_ask) / 2);
+          onVol(d.volume || 0);
+          onBook({
+            bids: [{ price: d.yes_bid / 100, size: d.open_interest || 0 }],
+            asks: [{ price: d.yes_ask / 100, size: d.open_interest || 0 }],
+          });
+          failStreak = 0;
+          onStatus("live");
         } else {
-          onStatus("disconnected");
+          failStreak++;
         }
-      };
-    } catch { onStatus("error"); }
+      } else {
+        failStreak++;
+      }
+    } catch {
+      failStreak++;
+    }
+    if (failStreak >= 3) onStatus("error");
+    if (alive) setTimeout(poll, 2000);
   }
 
-  connect();
-  return () => { alive = false; ws?.close(); onStatus("disconnected"); };
+  poll();
+  return () => { alive = false; onStatus("disconnected"); };
 }
 
 // YES price in cents from a market object
@@ -443,13 +393,11 @@ export default function App() {
   const [kalshiKeyId, setKalshiKeyId]   = useState("");       // Kalshi API Key ID
   const [kalshiPrivKey, setKalshiPrivKey] = useState("");     // RSA private key (PEM)
   const [connected, setConnected]       = useState(false);
-  const [liveMode, setLiveMode]         = useState(false);    // false = paper, true = real orders
   const [connError, setConnError]       = useState("");
   const [liveBalance, setLiveBalance]   = useState(null);     // Kalshi balance in cents
   const [orderLog, setOrderLog]         = useState([]);       // Kalshi order responses
   const [wsStatus, setWsStatus]         = useState("disconnected"); // ws price feed status
   const creds = useRef({});
-  const liveModeRef = useRef(false);
 
   // Live market data
   const [markets, setMarkets] = useState([]);
@@ -580,7 +528,12 @@ export default function App() {
     creds.current = { kalshiKeyId, kalshiPrivKey };
   }, [kalshiKeyId, kalshiPrivKey]);
 
-  useEffect(() => { liveModeRef.current = liveMode; }, [liveMode]);
+  // Reconnect WebSocket with auth when credentials are connected
+  useEffect(() => {
+    if (connected && selectedMarket) {
+      handleSelectMarket(selectedMarket);
+    }
+  }, [connected]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch live Kalshi balance when connected
   useEffect(() => {
@@ -602,7 +555,6 @@ export default function App() {
   }, [connected, kalshiKeyId, kalshiPrivKey]);
 
   const priceFeedRef = useRef(null);
-  const pollRef = useRef(null);
 
   const handleSelectMarket = (market) => {
     setSelectedMarket(market);
@@ -616,9 +568,8 @@ export default function App() {
     liveVolBuffer.current = [];
     lastCandleTime.current = Date.now();
 
-    // Disconnect previous feeds
+    // Disconnect previous feed
     if (priceFeedRef.current) priceFeedRef.current();
-    if (pollRef.current) clearInterval(pollRef.current);
 
     // Kalshi market ticker is used directly as the identifier
     const ticker = market.id;
@@ -648,19 +599,12 @@ export default function App() {
     const onBook = (book) => setOrderBook(book);
     const onStatus = (s) => setWsStatus(s);
 
-    // Try WebSocket first
     setWsStatus("connecting");
     priceFeedRef.current = createPriceFeed(ticker, onPrice, onVol, onBook, onStatus);
-
-    // Also poll REST every 4s as reliable fallback
-    pollRef.current = setInterval(() => {
-      pollKalshiPrice(ticker, onPrice, onVol, onBook);
-    }, 4000);
   };
 
   useEffect(() => () => {
     if (priceFeedRef.current) priceFeedRef.current();
-    if (pollRef.current) clearInterval(pollRef.current);
   }, []);
 
   // Tick every 30s so time-window PnL counters drop expired trades naturally
@@ -840,8 +784,8 @@ export default function App() {
     setTradeCount(c => c + 1);
     if (edgeBotOn) evaluateEntry(id, price, size, side);
 
-    // Submit live order to Kalshi when in live mode
-    if (liveModeRef.current && creds.current.kalshiKeyId && creds.current.kalshiPrivKey) {
+    // Submit live order to Kalshi
+    if (creds.current.kalshiKeyId && creds.current.kalshiPrivKey) {
       const ticker = selectedMarket?.id;
       if (ticker && !ticker.startsWith("KXBTCD-T")) {
         // Only place real orders on live Kalshi tickers (not static fallback)
@@ -996,17 +940,16 @@ export default function App() {
             <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00c805", display: "inline-block", animation: "pulseGlow 1.2s ease infinite" }} /> LIVE
           </span>}
           {connected && (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 9px", borderRadius: "100px", background: liveMode ? "#ff500015" : "#4488ff15", border: `1px solid ${liveMode ? "#ff500033" : "#4488ff33"}`, fontSize: "10px", fontWeight: 700, color: liveMode ? "#ff5000" : "#4488ff" }}>
-              {liveMode ? "🔴 LIVE" : "📄 PAPER"}
+            <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 9px", borderRadius: "100px", background: "#ff500015", border: "1px solid #ff500033", fontSize: "10px", fontWeight: 700, color: "#ff5000" }}>
+              🔴 LIVE
             </span>
           )}
           {(() => {
             const wsMap = {
               live:         { label: "LIVE",       col: "#00c805", pulse: true  },
               connecting:   { label: "CONNECTING", col: "#f5a623", pulse: true  },
-              reconnecting: { label: "RECONNECTING",col: "#f5a623", pulse: true  },
-              error:        { label: "WS ERROR",   col: "#ff5000", pulse: false },
-              disconnected: { label: "SIM",        col: "#555",    pulse: false },
+              error:        { label: "ERROR",      col: "#ff5000", pulse: false },
+              disconnected: { label: "OFFLINE",    col: "#555",    pulse: false },
             };
             const s = wsMap[wsStatus] || wsMap.disconnected;
             return (
@@ -1104,17 +1047,13 @@ export default function App() {
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 800, color: "#00c805", fontSize: "14px" }}>Connected to Kalshi</div>
                       <div style={{ fontSize: "11px", color: "#bbb", marginTop: "2px" }}>
-                        {liveMode ? "🔴 LIVE orders enabled" : "📄 Paper trading mode"}
+                        🔴 LIVE orders enabled
                         {liveBalance !== null && <span style={{ marginLeft: "10px", color: "#00c805" }}>· Balance: ${fmt(liveBalance / 100)}</span>}
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: "8px" }}>
-                      <BubbleBtn size="sm" active={liveMode} color={liveMode ? "#ff5000" : "#f5a623"}
-                        onClick={() => setLiveMode(v => !v)}>
-                        {liveMode ? "🔴 Live" : "📄 Paper"}
-                      </BubbleBtn>
                       <BubbleBtn size="sm" active color="#ff5000" onClick={() => {
-                        setConnected(false); setLiveMode(false);
+                        setConnected(false);
                         setKalshiKeyId(""); setKalshiPrivKey("");
                         setConnError("");
                       }}>Disconnect</BubbleBtn>
@@ -1194,9 +1133,9 @@ export default function App() {
                     <div key={o.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 8px", borderBottom: "1px solid #141414", fontSize: "11px" }}>
                       <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
                         <span style={{ padding: "2px 7px", borderRadius: "6px", fontSize: "10px", fontWeight: 700,
-                          background: o.status === "filled" ? "#00c80520" : o.status === "paper" ? "#4488ff20" : "#ff500020",
-                          color: o.status === "filled" ? "#00c805" : o.status === "paper" ? "#4488ff" : "#ff5000" }}>
-                          {o.status === "paper" ? "PAPER" : o.status?.toUpperCase()}
+                          background: o.status === "filled" ? "#00c80520" : "#ff500020",
+                          color: o.status === "filled" ? "#00c805" : "#ff5000" }}>
+                          {o.status?.toUpperCase()}
                         </span>
                         <span style={{ color: o.side === "YES" ? "#00c805" : "#ff5000", fontWeight: 700 }}>{o.side}</span>
                         <span style={{ color: "#bbb" }}>${o.size} @ {o.price}¢</span>
@@ -1212,7 +1151,7 @@ export default function App() {
             <Card>
               <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "12px" }}>🌐 API Status</div>
               <StatRow label="REST API" value="api.elections.kalshi.com" />
-              <StatRow label="WebSocket" value={wsStatus === "live" ? "🟢 Live" : wsStatus === "connecting" ? "🟡 Connecting…" : wsStatus === "reconnecting" ? "🟠 Reconnecting…" : "⚫ Disconnected"} valueColor={wsStatus === "live" ? "#00c805" : wsStatus === "connecting" || wsStatus === "reconnecting" ? "#f5a623" : "#555"} />
+              <StatRow label="Price Feed" value={wsStatus === "live" ? "🟢 Live" : wsStatus === "connecting" ? "🟡 Connecting…" : wsStatus === "error" ? "🔴 Error" : "⚫ Offline"} valueColor={wsStatus === "live" ? "#00c805" : wsStatus === "connecting" ? "#f5a623" : wsStatus === "error" ? "#ff5000" : "#555"} />
               <StatRow label="Markets loaded" value={`${markets.length} BTC markets`} valueColor="#00c805" />
               <StatRow label="Data source" value={dataSource === "live" ? "🟢 Kalshi Live" : dataSource === "static" ? "⚫ Static fallback" : "…"} />
               <StatRow label="Last refresh" value={lastFetched?.toLocaleTimeString() || "—"} />
@@ -1235,7 +1174,7 @@ export default function App() {
               <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "6px", color: "#ff5000" }}>⚠️ Risk Warning</div>
               <div style={{ fontSize: "12px", color: "#bbb", lineHeight: 1.7 }}>
                 Prediction market trading carries significant risk of loss. This bot is experimental software — not financial advice.
-                In LIVE mode, real USD will be spent on Kalshi. Start with paper trading to verify performance. Never risk more than you can afford to lose.
+                Real USD will be spent on Kalshi when credentials are connected. Never risk more than you can afford to lose.
               </div>
             </Card>
 
@@ -1283,7 +1222,7 @@ export default function App() {
                       <div style={{ display: "flex", gap: "5px", marginLeft: "8px", flexShrink: 0, alignItems: "center" }}>
                         {wsStatus === "live"
                           ? <span style={{ fontSize: "9px", color: "#00c805", fontWeight: 700, display: "flex", alignItems: "center", gap: "3px" }}><span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00c805", display: "inline-block", animation: "pulseGlow 1s infinite" }} />LIVE</span>
-                          : <span style={{ fontSize: "9px", color: "#f5a623", fontWeight: 700 }}>{wsStatus === "connecting" ? "⟳ connecting" : "SIM"}</span>
+                          : <span style={{ fontSize: "9px", color: "#f5a623", fontWeight: 700 }}>{wsStatus === "connecting" ? "⟳ connecting" : "OFFLINE"}</span>
                         }
                         <Badge color="green">YES {liveYesPrice ? fmt(liveYesPrice, 1) : parseYesPrice(selectedMarket)}¢</Badge>
                         <Badge color="red">NO {liveYesPrice ? fmt(100 - liveYesPrice, 1) : 100 - parseYesPrice(selectedMarket)}¢</Badge>
