@@ -102,8 +102,8 @@ async function closePosition({ ticker, side, contracts, currentPriceCents, apiKe
   }
 }
 
-// ── Price action analysis — studies candles before committing to a position ───
-function analyzePriceAction(candles, currentPrice) {
+// ── Price action analysis — studies candles + live BTC spot before entering ──
+function analyzePriceAction(candles, currentPrice, btcData = null) {
   if (candles.length < 15) return { signal: "WAIT", confidence: 0, reason: "Collecting candle data…" };
 
   const recent = candles.slice(-20);
@@ -131,7 +131,6 @@ function analyzePriceAction(candles, currentPrice) {
   const last3 = candles.slice(-3);
   const bodyQual = last3.reduce((a, c) => a + Math.abs(c.close - c.open) / Math.max(c.high - c.low, 0.1), 0) / 3;
 
-  // Score each direction (max 5 points each)
   let up = 0, dn = 0;
   if (momentum > 0.4)  up++; else if (momentum < -0.4) dn++;
   if (bullCount >= 6)  up++; else if (bearCount >= 6)   dn++;
@@ -140,23 +139,58 @@ function analyzePriceAction(candles, currentPrice) {
   if (bodyQual > 0.3 && last3[2].close > last3[2].open) up++;
   else if (bodyQual > 0.3 && last3[2].close < last3[2].open) dn++;
 
-  const trend = momentum > 0 ? "↑" : "↓";
+  // ── BTC Spot factors (3 additional signals when Binance data is present) ──
+  // Kalshi BTC markets settle on CF Benchmarks RTI which closely tracks Binance spot.
+  // Strong spot momentum = real directional edge before market price adjusts.
+  const maxScore = btcData?.candles?.length >= 10 ? 8 : 5;
+  let btcReason = "";
+
+  if (btcData?.candles?.length >= 10) {
+    const { change1m, change5m, candles: bc } = btcData;
+    const c1m = change1m ?? 0;
+    const c5m = change5m ?? 0;
+
+    // 6. Spot momentum: meaningful 1m or 5m directional move
+    if (c1m > 0.05 || c5m > 0.15)        up++;
+    else if (c1m < -0.05 || c5m < -0.15) dn++;
+
+    // 7. BTC bull/bear count in last 10 one-minute candles
+    const btcLast10 = bc.slice(-10);
+    const btcBulls  = btcLast10.filter(c => c.close >= c.open).length;
+    if (btcBulls >= 7)      up++;
+    else if (btcBulls <= 3) dn++;
+
+    // 8. BTC volume surge with direction confirmation
+    const btcLast3  = bc.slice(-3);
+    const btcPrior7 = bc.slice(-10, -3);
+    const btcVolNow = btcLast3.reduce((a, c) => a + c.vol, 0) / 3;
+    const btcVolOld = btcPrior7.reduce((a, c) => a + c.vol, 0) / 7;
+    if (btcVolOld > 0 && btcVolNow > btcVolOld * 1.2) {
+      if (c1m > 0) up++; else if (c1m < 0) dn++;
+    }
+
+    const s1 = (c1m >= 0 ? "+" : "") + c1m.toFixed(3) + "%";
+    const s5 = (c5m >= 0 ? "+" : "") + c5m.toFixed(2) + "%";
+    btcReason = ` · BTC 1m${s1} 5m${s5} (${btcBulls}/10 bull)`;
+  }
+
+  const trend  = momentum > 0 ? "↑" : "↓";
   const volStr = volUp ? "expanding" : "flat";
 
   if (up >= 3 && up > dn) return {
-    signal: "YES", confidence: up / 5,
-    reason: `${bullCount}/10 bull · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%`,
-    up, dn,
+    signal: "YES", confidence: up / maxScore,
+    reason: `${bullCount}/10 bull · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%${btcReason}`,
+    up, dn, maxScore,
   };
   if (dn >= 3 && dn > up) return {
-    signal: "NO", confidence: dn / 5,
-    reason: `${bearCount}/10 bear · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%`,
-    up, dn,
+    signal: "NO", confidence: dn / maxScore,
+    reason: `${bearCount}/10 bear · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%${btcReason}`,
+    up, dn, maxScore,
   };
   return {
     signal: "WAIT", confidence: 0,
-    reason: `Mixed: ${up}↑ ${dn}↓ · bull ${bullCount}/10 · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢`,
-    up, dn,
+    reason: `Mixed: ${up}↑ ${dn}↓ · bull ${bullCount}/10 · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢${btcReason}`,
+    up, dn, maxScore,
   };
 }
 
@@ -547,12 +581,19 @@ export default function App() {
   // Analysis bot state
   const [currentAnalysis, setCurrentAnalysis] = useState({ signal: "WAIT", confidence: 0, reason: "Waiting for candles…" });
 
+  // BTC spot data from Binance (supplementary signal source)
+  const [btcSpot, setBtcSpot]         = useState(null);
+  const [btcChange1m, setBtcChange1m] = useState(null);
+  const [btcChange5m, setBtcChange5m] = useState(null);
+  const [btcCandles, setBtcCandles]   = useState([]);
+
   // Refs for stable access inside callbacks
   const liveYesPriceRef   = useRef(null);
   const selectedMarketRef = useRef(null);
   const candlesRef        = useRef([]);
   const tradesRef         = useRef([]);
   const closingTradesRef  = useRef(new Set());
+  const btcDataRef        = useRef({ price: null, change1m: null, change5m: null, candles: [] });
 
   // ── Fetch live markets ────────────────────────────────────────────────────
   const [dataSource, setDataSource] = useState("loading");
@@ -618,6 +659,9 @@ export default function App() {
   useEffect(() => { selectedMarketRef.current = selectedMarket; }, [selectedMarket]);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
   useEffect(() => { tradesRef.current = trades; }, [trades]);
+  useEffect(() => {
+    btcDataRef.current = { price: btcSpot, change1m: btcChange1m, change5m: btcChange5m, candles: btcCandles };
+  }, [btcSpot, btcChange1m, btcChange5m, btcCandles]);
 
   // Reconnect WebSocket with auth when credentials are connected
   useEffect(() => {
@@ -709,6 +753,27 @@ export default function App() {
   useEffect(() => {
     const t = setInterval(() => setTradeTick(v => v + 1), 400);
     return () => clearInterval(t);
+  }, []);
+
+  // ── Binance BTC spot polling — every 3s, feeds analysis engine ──────────
+  useEffect(() => {
+    let alive = true;
+    async function fetchBtc() {
+      try {
+        const resp = await fetch("/.netlify/functions/btc-price");
+        if (!alive || !resp.ok) return;
+        const d = await resp.json();
+        if (d.success && d.price) {
+          setBtcSpot(d.price);
+          setBtcChange1m(d.change1m ?? null);
+          setBtcChange5m(d.change5m ?? null);
+          setBtcCandles(Array.isArray(d.candles) ? d.candles : []);
+        }
+      } catch { /* BTC data is supplementary — never block trading on failure */ }
+    }
+    fetchBtc();
+    const t = setInterval(fetchBtc, 3000);
+    return () => { alive = false; clearInterval(t); };
   }, []);
 
   // ── Auto-switch to next open market when current one expires ─────────────
@@ -885,8 +950,8 @@ export default function App() {
     // Block entries if the market window has expired
     if (selectedMarket.endDate && Date.now() >= new Date(selectedMarket.endDate).getTime()) return;
 
-    // Analysis Bot: study price action before committing
-    const analysis = analyzePriceAction(candlesRef.current, price);
+    // Analysis Bot: study price action before committing (Kalshi + BTC spot factors)
+    const analysis = analyzePriceAction(candlesRef.current, price, btcDataRef.current);
     const desiredSide = candleBullish ? "YES" : "NO";
     const analysisAgrees = analysis.signal === desiredSide;
     // Require analysis confirmation unless analysis says WAIT (neutral)
@@ -1022,7 +1087,7 @@ export default function App() {
           }
         }
         // Update analysis on every candle
-        setCurrentAnalysis(analyzePriceAction(updated, newClose));
+        setCurrentAnalysis(analyzePriceAction(updated, newClose, btcDataRef.current));
         return updated;
       });
     }, 1200);
@@ -1424,6 +1489,34 @@ export default function App() {
 
                 </div>
 
+                {/* ── BTC Spot Signal Row ── */}
+                {btcSpot && (() => {
+                  const c1m = btcChange1m ?? 0;
+                  const c5m = btcChange5m ?? 0;
+                  const sig = currentAnalysis.signal;
+                  const btcDir   = c5m > 0.05 ? "UP" : c5m < -0.05 ? "DOWN" : "FLAT";
+                  const kalshiDir = sig === "YES" ? "UP" : sig === "NO" ? "DOWN" : "FLAT";
+                  const aligned  = btcDir !== "FLAT" && kalshiDir !== "FLAT" && btcDir === kalshiDir;
+                  const opposed  = btcDir !== "FLAT" && kalshiDir !== "FLAT" && btcDir !== kalshiDir;
+                  const alignColor = aligned ? "#00c805" : opposed ? "#ff5000" : "#f5a623";
+                  const alignLabel = aligned ? "ALIGNED" : opposed ? "OPPOSED" : "NEUTRAL";
+                  const chgColor = v => v > 0 ? "#00c805" : v < 0 ? "#ff5000" : "#555";
+                  const chgStr   = (v, d = 3) => (v >= 0 ? "+" : "") + v.toFixed(d) + "%";
+                  return (
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 10px", borderRadius: "9px", background: "#0a0a0a", border: "1px solid #181818", marginBottom: "10px", flexWrap: "wrap" }}>
+                      <span style={{ fontSize: "11px", color: "#f7931a", fontWeight: 800 }}>₿</span>
+                      <span style={{ fontSize: "12px", fontWeight: 700, color: "#fff" }}>${btcSpot.toLocaleString("en-US", { maximumFractionDigits: 0 })}</span>
+                      <span style={{ width: "1px", height: "14px", background: "#222", flexShrink: 0 }} />
+                      <span style={{ fontSize: "10px", fontWeight: 700, color: chgColor(c1m) }}>1m {chgStr(c1m)}</span>
+                      <span style={{ fontSize: "10px", fontWeight: 700, color: chgColor(c5m) }}>5m {chgStr(c5m, 2)}</span>
+                      <span style={{ flex: 1 }} />
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 8px", borderRadius: "100px", background: `${alignColor}18`, border: `1px solid ${alignColor}44`, fontSize: "10px", fontWeight: 800, color: alignColor }}>
+                        {aligned ? "✓" : opposed ? "✗" : "~"} BTC {alignLabel}
+                      </span>
+                    </div>
+                  );
+                })()}
+
                 {/* Live chart */}
                 <div style={{ background: "#0a0a0a", borderRadius: "10px", padding: "8px 6px 4px", marginBottom: "12px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", padding: "0 4px 6px" }}>
@@ -1569,8 +1662,8 @@ export default function App() {
                       {/* Factor breakdown */}
                       {currentAnalysis.up != null && (
                         <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
-                          <span style={{ fontSize: "10px", color: "#00c805", fontWeight: 700 }}>↑ {currentAnalysis.up}/5</span>
-                          <span style={{ fontSize: "10px", color: "#ff5000", fontWeight: 700 }}>↓ {currentAnalysis.dn}/5</span>
+                          <span style={{ fontSize: "10px", color: "#00c805", fontWeight: 700 }}>↑ {currentAnalysis.up}/{currentAnalysis.maxScore ?? 5}</span>
+                          <span style={{ fontSize: "10px", color: "#ff5000", fontWeight: 700 }}>↓ {currentAnalysis.dn}/{currentAnalysis.maxScore ?? 5}</span>
                         </div>
                       )}
                       <div style={{ fontSize: "10px", color: "#666", lineHeight: 1.4 }}>{currentAnalysis.reason}</div>
