@@ -596,7 +596,7 @@ export default function App() {
       } catch {}
     };
     load();
-    const t = setInterval(load, 30000);
+    const t = setInterval(load, 15000);
     return () => clearInterval(t);
   }, [connected, kalshiKeyId, kalshiPrivKey]);
 
@@ -1051,11 +1051,21 @@ export default function App() {
           </div>
           <div style={{ width: "1px", height: "36px", background: "#1e1e1e" }} />
           {/* Portfolio */}
-          <div style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: "14px", padding: "6px 14px", textAlign: "center" }}>
-            <div style={{ fontSize: "9px", color: "#999", fontWeight: 700, letterSpacing: "0.08em" }}>PORTFOLIO</div>
-            <div style={{ fontSize: "16px", fontWeight: 800, lineHeight: 1.2 }}>${fmt(balance)}</div>
-            <div style={{ fontSize: "9px", color: totalPnl >= 0 ? "#00c805" : "#ff5000", fontWeight: 700 }}>{fmtPnl(totalPnl)}</div>
-          </div>
+          {(() => {
+            const displayBalance = connected && liveBalance !== null ? liveBalance / 100 : balance;
+            const isLive = connected && liveBalance !== null;
+            return (
+              <div style={{ background: "#111", border: `1px solid ${isLive ? "#00c80533" : "#1e1e1e"}`, borderRadius: "14px", padding: "6px 14px", textAlign: "center" }}>
+                <div style={{ fontSize: "9px", color: isLive ? "#00c805" : "#999", fontWeight: 700, letterSpacing: "0.08em" }}>
+                  {isLive ? "KALSHI" : "PORTFOLIO"}
+                </div>
+                <div style={{ fontSize: "16px", fontWeight: 800, lineHeight: 1.2 }}>${fmt(displayBalance)}</div>
+                <div style={{ fontSize: "9px", color: totalPnl >= 0 ? "#00c805" : "#ff5000", fontWeight: 700 }}>
+                  {isLive ? "live balance" : fmtPnl(totalPnl)}
+                </div>
+              </div>
+            );
+          })()}
           <div style={{ width: "1px", height: "36px", background: "#1e1e1e" }} />
           {/* Earnings Counter */}
           <div style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: "14px", padding: "6px 14px" }}>
