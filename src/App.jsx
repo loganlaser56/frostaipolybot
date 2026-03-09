@@ -102,95 +102,58 @@ async function closePosition({ ticker, side, contracts, currentPriceCents, apiKe
   }
 }
 
-// ── Price action analysis — studies candles + live BTC spot before entering ──
+// ── Price action analysis — 3 factors, all must agree (no partial credit) ────
+// Kalshi BTC markets settle on CF Benchmarks RTI = Binance/Coinbase spot.
+// Signal only fires when Kalshi candles + BTC spot are aligned. This means
+// fewer entries but each one has clear multi-source confirmation.
 function analyzePriceAction(candles, currentPrice, btcData = null) {
-  if (candles.length < 15) return { signal: "WAIT", confidence: 0, reason: "Collecting candle data…" };
+  if (candles.length < 10) return { signal: "WAIT", confidence: 0, reason: "Collecting candles…", factors: null };
 
-  const recent = candles.slice(-20);
-  const last5  = candles.slice(-5);
-  const last10 = candles.slice(-10);
+  // Factor 1 — Kalshi price momentum: net move of last 5 candles
+  const last5 = candles.slice(-5);
+  const kalshiNet = last5[4].close - last5[0].open;
+  const kalshiDir = kalshiNet > 0.5 ? "UP" : kalshiNet < -0.5 ? "DOWN" : null;
 
-  // 1. Momentum: net close move over last 5 candles
-  const momentum = last5[last5.length - 1].close - last5[0].open;
+  // Factor 2 — BTC 5-min spot trend (this IS the settlement driver)
+  const c5m = btcData?.change5m ?? null;
+  const btcDir5m = c5m === null ? null : c5m > 0.08 ? "UP" : c5m < -0.08 ? "DOWN" : null;
 
-  // 2. Trend: bull vs bear candle count in last 10
-  const bullCount = last10.filter(c => c.close >= c.open).length;
-  const bearCount = 10 - bullCount;
+  // Factor 3 — BTC 1-min momentum (current spot pulse — veto if reversing)
+  const c1m = btcData?.change1m ?? null;
+  const btcDir1m = c1m === null ? null : c1m > 0.03 ? "UP" : c1m < -0.03 ? "DOWN" : null;
 
-  // 3. Volume expansion: last 5 avg vs prior 15 avg
-  const recentVol = last5.reduce((a, c) => a + c.vol, 0) / 5;
-  const priorVol  = recent.slice(0, 15).reduce((a, c) => a + c.vol, 0) / 15;
-  const volUp = recentVol > priorVol * 1.08;
+  const factors = { kalshiDir, btcDir5m, btcDir1m };
+  const hasBtc = c5m !== null;
 
-  // 4. Price position in 20-candle range
-  const rangeHigh = Math.max(...recent.map(c => c.high));
-  const rangeLow  = Math.min(...recent.map(c => c.low));
-  const rangePos  = (currentPrice - rangeLow) / Math.max(rangeHigh - rangeLow, 1);
+  const s5 = c5m !== null ? (c5m >= 0 ? "+" : "") + c5m.toFixed(2) + "%" : "—";
+  const s1 = c1m !== null ? (c1m >= 0 ? "+" : "") + c1m.toFixed(3) + "%" : "—";
 
-  // 5. Last 3 candles: body strength (avoid doji entries)
-  const last3 = candles.slice(-3);
-  const bodyQual = last3.reduce((a, c) => a + Math.abs(c.close - c.open) / Math.max(c.high - c.low, 0.1), 0) / 3;
+  // All available signals must agree — 1m divergence vetoes the trade
+  const yesSignal = kalshiDir === "UP"   && (!hasBtc || (btcDir5m === "UP"   && btcDir1m !== "DOWN"));
+  const noSignal  = kalshiDir === "DOWN" && (!hasBtc || (btcDir5m === "DOWN" && btcDir1m !== "UP"));
 
-  let up = 0, dn = 0;
-  if (momentum > 0.4)  up++; else if (momentum < -0.4) dn++;
-  if (bullCount >= 6)  up++; else if (bearCount >= 6)   dn++;
-  if (volUp && momentum > 0) up++; else if (volUp && momentum < 0) dn++;
-  if (rangePos > 0.55) up++; else if (rangePos < 0.45) dn++;
-  if (bodyQual > 0.3 && last3[2].close > last3[2].open) up++;
-  else if (bodyQual > 0.3 && last3[2].close < last3[2].open) dn++;
-
-  // ── BTC Spot factors (3 additional signals when Binance data is present) ──
-  // Kalshi BTC markets settle on CF Benchmarks RTI which closely tracks Binance spot.
-  // Strong spot momentum = real directional edge before market price adjusts.
-  const maxScore = btcData?.candles?.length >= 10 ? 8 : 5;
-  let btcReason = "";
-
-  if (btcData?.candles?.length >= 10) {
-    const { change1m, change5m, candles: bc } = btcData;
-    const c1m = change1m ?? 0;
-    const c5m = change5m ?? 0;
-
-    // 6. Spot momentum: meaningful 1m or 5m directional move
-    if (c1m > 0.05 || c5m > 0.15)        up++;
-    else if (c1m < -0.05 || c5m < -0.15) dn++;
-
-    // 7. BTC bull/bear count in last 10 one-minute candles
-    const btcLast10 = bc.slice(-10);
-    const btcBulls  = btcLast10.filter(c => c.close >= c.open).length;
-    if (btcBulls >= 7)      up++;
-    else if (btcBulls <= 3) dn++;
-
-    // 8. BTC volume surge with direction confirmation
-    const btcLast3  = bc.slice(-3);
-    const btcPrior7 = bc.slice(-10, -3);
-    const btcVolNow = btcLast3.reduce((a, c) => a + c.vol, 0) / 3;
-    const btcVolOld = btcPrior7.reduce((a, c) => a + c.vol, 0) / 7;
-    if (btcVolOld > 0 && btcVolNow > btcVolOld * 1.2) {
-      if (c1m > 0) up++; else if (c1m < 0) dn++;
-    }
-
-    const s1 = (c1m >= 0 ? "+" : "") + c1m.toFixed(3) + "%";
-    const s5 = (c5m >= 0 ? "+" : "") + c5m.toFixed(2) + "%";
-    btcReason = ` · BTC 1m${s1} 5m${s5} (${btcBulls}/10 bull)`;
-  }
-
-  const trend  = momentum > 0 ? "↑" : "↓";
-  const volStr = volUp ? "expanding" : "flat";
-
-  if (up >= 3 && up > dn) return {
-    signal: "YES", confidence: up / maxScore,
-    reason: `${bullCount}/10 bull · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%${btcReason}`,
-    up, dn, maxScore,
+  if (yesSignal) return {
+    signal: "YES", confidence: 1,
+    reason: `Kalshi +${fmt(Math.abs(kalshiNet), 1)}¢ · BTC 5m ${s5} · 1m ${s1}`,
+    factors,
   };
-  if (dn >= 3 && dn > up) return {
-    signal: "NO", confidence: dn / maxScore,
-    reason: `${bearCount}/10 bear · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢ · vol ${volStr} · range ${Math.round(rangePos * 100)}%${btcReason}`,
-    up, dn, maxScore,
+  if (noSignal) return {
+    signal: "NO", confidence: 1,
+    reason: `Kalshi −${fmt(Math.abs(kalshiNet), 1)}¢ · BTC 5m ${s5} · 1m ${s1}`,
+    factors,
   };
+
+  // Build a specific wait reason so the user understands what's missing
+  const why = [];
+  if (!kalshiDir) why.push(`Kalshi flat (${fmt(kalshiNet, 1)}¢)`);
+  else if (hasBtc && btcDir5m !== kalshiDir) why.push(`BTC 5m ${s5} disagrees`);
+  else if (hasBtc && btcDir1m && btcDir1m !== kalshiDir) why.push(`BTC 1m ${s1} reversing`);
+  else if (!hasBtc) why.push("awaiting BTC feed");
+
   return {
     signal: "WAIT", confidence: 0,
-    reason: `Mixed: ${up}↑ ${dn}↓ · bull ${bullCount}/10 · momentum ${trend}${fmt(Math.abs(momentum), 1)}¢${btcReason}`,
-    up, dn, maxScore,
+    reason: why.join(" · ") || "signals mixed",
+    factors,
   };
 }
 
@@ -1639,34 +1602,66 @@ export default function App() {
                   const col = sig === "YES" ? "#00c805" : sig === "NO" ? "#ff5000" : "#f5a623";
                   const icon = sig === "YES" ? "↑" : sig === "NO" ? "↓" : "⏸";
                   const label = sig === "YES" ? "BUY YES" : sig === "NO" ? "BUY NO" : "WAIT";
-                  const conf = Math.round((currentAnalysis.confidence || 0) * 100);
+                  const f = currentAnalysis.factors;
+
+                  // Each factor: null = no data, "UP"/"DOWN" = direction, used to show pass/fail per factor
+                  const factorRows = [
+                    {
+                      name: "Kalshi momentum",
+                      dir: f?.kalshiDir ?? null,
+                      pass: f?.kalshiDir != null,
+                    },
+                    {
+                      name: "BTC 5m trend",
+                      dir: f?.btcDir5m ?? null,
+                      pass: f?.btcDir5m != null,
+                      noData: btcSpot === null,
+                    },
+                    {
+                      name: "BTC 1m pulse",
+                      dir: f?.btcDir1m ?? null,
+                      pass: f?.btcDir1m != null && f.btcDir1m === (sig !== "WAIT" ? (sig === "YES" ? "UP" : "DOWN") : f.kalshiDir),
+                      noData: btcSpot === null,
+                    },
+                  ];
+
                   return (
                     <div style={{ background: "#0a0a0a", border: `1px solid ${col}33`, borderRadius: "12px", padding: "12px", marginBottom: "14px" }}>
-                      <div style={{ fontSize: "9px", color: "#555", fontWeight: 700, letterSpacing: "0.1em", marginBottom: "8px" }}>ANALYSIS BOT</div>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                          <span style={{ fontSize: "20px", fontWeight: 800, color: col }}>{icon}</span>
-                          <div>
-                            <div style={{ fontWeight: 800, fontSize: "15px", color: col }}>{label}</div>
-                            <div style={{ fontSize: "10px", color: "#555" }}>{conf}% confidence</div>
-                          </div>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+                        <div style={{ fontSize: "9px", color: "#555", fontWeight: 700, letterSpacing: "0.1em" }}>ANALYSIS BOT</div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span style={{ fontSize: "16px", fontWeight: 800, color: col }}>{icon}</span>
+                          <span style={{ fontWeight: 800, fontSize: "13px", color: col }}>{label}</span>
+                          {currentAnalysis.blocked && (
+                            <span style={{ fontSize: "9px", color: "#ff5000", fontWeight: 700, padding: "1px 6px", background: "#ff500015", borderRadius: "5px" }}>BLOCKED</span>
+                          )}
                         </div>
-                        {currentAnalysis.blocked && (
-                          <span style={{ fontSize: "10px", color: "#ff5000", fontWeight: 700, padding: "2px 8px", background: "#ff500015", borderRadius: "6px" }}>BLOCKED ENTRY</span>
-                        )}
                       </div>
-                      {/* Confidence bar */}
-                      <div style={{ background: "#1a1a1a", borderRadius: "100px", height: "3px", overflow: "hidden", marginBottom: "6px" }}>
-                        <div style={{ width: `${conf}%`, height: "100%", background: col, borderRadius: "100px", transition: "width 0.5s" }} />
+
+                      {/* 3-factor checklist */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "5px", marginBottom: "8px" }}>
+                        {factorRows.map((row, i) => {
+                          const active = sig !== "WAIT";
+                          const agree = row.dir === (sig === "YES" ? "UP" : sig === "NO" ? "DOWN" : null);
+                          const dot = row.noData ? "#333"
+                            : !row.dir ? "#444"
+                            : active && agree ? "#00c805"
+                            : active && !agree ? "#ff5000"
+                            : "#f5a623";
+                          const dotLabel = row.noData ? "·" : !row.dir ? "·" : active && agree ? "✓" : active && !agree ? "✗" : row.dir === "UP" ? "↑" : "↓";
+                          return (
+                            <div key={i} style={{ display: "flex", alignItems: "center", gap: "7px" }}>
+                              <span style={{ fontSize: "11px", fontWeight: 800, color: dot, width: "12px", textAlign: "center" }}>{dotLabel}</span>
+                              <span style={{ fontSize: "10px", color: row.noData ? "#333" : "#888", flex: 1 }}>{row.name}</span>
+                              <span style={{ fontSize: "10px", color: dot, fontWeight: 700 }}>
+                                {row.noData ? "no feed" : !row.dir ? "flat" : row.dir}
+                              </span>
+                            </div>
+                          );
+                        })}
                       </div>
-                      {/* Factor breakdown */}
-                      {currentAnalysis.up != null && (
-                        <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
-                          <span style={{ fontSize: "10px", color: "#00c805", fontWeight: 700 }}>↑ {currentAnalysis.up}/{currentAnalysis.maxScore ?? 5}</span>
-                          <span style={{ fontSize: "10px", color: "#ff5000", fontWeight: 700 }}>↓ {currentAnalysis.dn}/{currentAnalysis.maxScore ?? 5}</span>
-                        </div>
-                      )}
-                      <div style={{ fontSize: "10px", color: "#666", lineHeight: 1.4 }}>{currentAnalysis.reason}</div>
+
+                      <div style={{ fontSize: "10px", color: "#555", lineHeight: 1.4, borderTop: "1px solid #181818", paddingTop: "7px" }}>{currentAnalysis.reason}</div>
                     </div>
                   );
                 })()}
