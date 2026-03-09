@@ -102,49 +102,9 @@ async function closePosition({ ticker, side, contracts, currentPriceCents, apiKe
   }
 }
 
-// ── Price action analysis — pure Kalshi momentum ─────────────────────────────
-// Trade in the direction the Kalshi YES price is already moving.
-// 5-candle net move sets direction; 3-candle check confirms it isn't reversing.
-function analyzePriceAction(candles, currentPrice) {
-  if (candles.length < 5) return { signal: "WAIT", confidence: 0, reason: "Collecting candles…", factors: null };
 
-  const last5 = candles.slice(-5);
-  const kalshiNet = last5[4].close - last5[0].open;
-  const last3 = candles.slice(-3);
-  const kalshiNet3 = last3[2].close - last3[0].open;
-
-  const factors = { kalshiNet: kalshiNet.toFixed(1), kalshiNet3: kalshiNet3.toFixed(1) };
-
-  const yesSignal = kalshiNet > 0.8 && kalshiNet3 > -0.3 && currentPrice < 65;
-  const noSignal  = kalshiNet < -0.8 && kalshiNet3 < 0.3 && currentPrice > 35;
-
-  if (yesSignal) return {
-    signal: "YES", confidence: 1,
-    reason: `Kalshi 5c +${fmt(Math.abs(kalshiNet), 1)}¢ · 3c ${fmt(kalshiNet3, 1)}¢ · YES ${fmt(currentPrice, 1)}¢`,
-    factors,
-  };
-  if (noSignal) return {
-    signal: "NO", confidence: 1,
-    reason: `Kalshi 5c −${fmt(Math.abs(kalshiNet), 1)}¢ · 3c ${fmt(kalshiNet3, 1)}¢ · YES ${fmt(currentPrice, 1)}¢`,
-    factors,
-  };
-
-  const why = [];
-  if (Math.abs(kalshiNet) <= 0.8) why.push(`Kalshi flat (${fmt(kalshiNet, 1)}¢ 5c move)`);
-  else if (kalshiNet > 0 && kalshiNet3 <= -0.3) why.push("3c momentum reversing");
-  else if (kalshiNet < 0 && kalshiNet3 >= 0.3)  why.push("3c momentum reversing");
-  else if (kalshiNet > 0 && currentPrice >= 65)  why.push(`YES ${fmt(currentPrice, 1)}¢ too high`);
-  else if (kalshiNet < 0 && currentPrice <= 35)  why.push(`YES ${fmt(currentPrice, 1)}¢ too low`);
-
-  return {
-    signal: "WAIT", confidence: 0,
-    reason: why.join(" · ") || "signals mixed",
-    factors,
-  };
-}
-
-// ── Kalshi price feed — REST polling every 2s (Kalshi WS blocks browser origins)
-function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
+// ── Kalshi price feed — REST polling every 1.5s, tracks order flow per tick
+function createPriceFeed(ticker, onPrice, onVol, onBook, onTick, onStatus) {
   let alive = true;
   let failStreak = 0;
   onStatus("connecting");
@@ -164,6 +124,7 @@ function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
             bids: [{ price: d.yes_bid / 100, size: d.open_interest || 0 }],
             asks: [{ price: d.yes_ask / 100, size: d.open_interest || 0 }],
           });
+          onTick({ yes_bid: d.yes_bid, yes_ask: d.yes_ask, volume: d.volume || 0, ts: Date.now() });
           failStreak = 0;
           onStatus("live");
         } else {
@@ -176,7 +137,7 @@ function createPriceFeed(ticker, onPrice, onVol, onBook, onStatus) {
       failStreak++;
     }
     if (failStreak >= 3) onStatus("error");
-    if (alive) setTimeout(poll, 2000);
+    if (alive) setTimeout(poll, 1500);
   }
 
   poll();
@@ -535,6 +496,7 @@ export default function App() {
   const closingTradesRef  = useRef(new Set());
   const btcDataRef        = useRef({ price: null, change1m: null, change5m: null, candles: [] });
   const lastEntryRef      = useRef(0);   // timestamp of last entry (cooldown guard)
+  const orderFlowRef      = useRef([]);  // rolling buffer of bid/ask ticks for flow detection
   const maxBetRef         = useRef(50);
   useEffect(() => { maxBetRef.current = maxBet; }, [maxBet]);
 
@@ -643,6 +605,7 @@ export default function App() {
     setTradeMarkers([]);
     setEntryPrice(null);
     liveVolBuffer.current = [];
+    orderFlowRef.current = [];
     lastCandleTime.current = Date.now();
 
     // Disconnect previous feed
@@ -674,10 +637,13 @@ export default function App() {
 
     const onVol = (v) => { liveVolBuffer.current.push(v); };
     const onBook = (book) => setOrderBook(book);
+    const onTick = (tick) => {
+      orderFlowRef.current = [...orderFlowRef.current.slice(-9), tick]; // keep last 10
+    };
     const onStatus = (s) => setWsStatus(s);
 
     setWsStatus("connecting");
-    priceFeedRef.current = createPriceFeed(ticker, onPrice, onVol, onBook, onStatus);
+    priceFeedRef.current = createPriceFeed(ticker, onPrice, onVol, onBook, onTick, onStatus);
   };
 
   useEffect(() => () => {
@@ -799,9 +765,9 @@ export default function App() {
       const elapsed  = Date.now() - trade.timestamp;
       const strat    = strategyRef.current;
 
-      // Profit/stop targets scale slightly with strategy mode
-      const profitTarget = strat === "aggressive" ? 16 : strat === "recovery" ? 10 : 14; // ¢
-      const stopTarget   = strat === "aggressive" ? 12 : strat === "recovery" ?  7 : 10; // ¢
+      // Quick scalp targets — small profit taken fast, tight stop
+      const profitTarget = strat === "aggressive" ? 8 : strat === "recovery" ? 4 : 6; // ¢
+      const stopTarget   = strat === "aggressive" ? 6 : strat === "recovery" ? 3 : 4; // ¢
 
       const currentPx = liveYesPriceRef.current ?? entryPx;
       const rawPnl = (trade.side === "YES" ? currentPx - entryPx : entryPx - currentPx)
@@ -810,7 +776,7 @@ export default function App() {
       // Exit conditions
       const profitHit  = trade.side === "YES" ? currentPx >= entryPx + profitTarget : currentPx <= entryPx - profitTarget;
       const stopHit    = trade.side === "YES" ? currentPx <= entryPx - stopTarget   : currentPx >= entryPx + stopTarget;
-      const nearSettle = msToSettle > 0 && msToSettle < 2 * 60_000;  // 2 min before end
+      const nearSettle = msToSettle > 0 && msToSettle < 90_000;  // 1.5 min before end
       const expired    = endTime > 0 && Date.now() >= endTime;
 
       if (!profitHit && !stopHit && !nearSettle && !expired) continue;
@@ -888,13 +854,13 @@ export default function App() {
     }
   }, [tradeTick, adjustStrategy]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Evaluate edge on every tick — pure Kalshi momentum ───────────────────
-  // Enter when the YES price has been trending for 5 candles and hasn't
-  // reversed on the last 3. No BTC signal required.
+  // ── Evaluate edge on every tick — order flow momentum ────────────────────
+  // Read the rolling bid/ask buffer to detect which side other traders are
+  // piling into. Enter when 5 consecutive ticks show coordinated pressure.
   useEffect(() => {
     if (!botActive) return;
-    // Allow up to 2 concurrent open trades
-    if (tradesRef.current.filter(t => t.status === "open").length >= 2) return;
+    // Allow up to 3 concurrent open trades
+    if (tradesRef.current.filter(t => t.status === "open").length >= 3) return;
 
     const market = selectedMarketRef.current;
     if (!market?.endDate) return;
@@ -902,30 +868,32 @@ export default function App() {
     const endTime    = new Date(market.endDate).getTime();
     const now        = Date.now();
     const windowStart = endTime - 15 * 60_000;
-    const timeInWindow = (now - windowStart) / 1000;   // seconds
-    const timeToEnd    = (endTime - now) / 1000;       // seconds
+    const timeInWindow = (now - windowStart) / 1000;
+    const timeToEnd    = (endTime - now) / 1000;
 
-    // Trade 0.5–12 min into window, with 1.5+ min left before settlement
-    if (timeInWindow < 30 || timeInWindow > 720 || timeToEnd < 90) return;
+    // Trade any time in the window with 1.5+ min left
+    if (timeInWindow < 30 || timeToEnd < 90) return;
 
-    const candles  = candlesRef.current;
+    const flow     = orderFlowRef.current;
     const yesPrice = liveYesPriceRef.current;
 
-    if (yesPrice == null || candles.length < 5) return;
+    if (yesPrice == null || flow.length < 5) return;
 
-    // 30-second cooldown between entries
-    if (now - lastEntryRef.current < 30_000) return;
+    // 15-second cooldown between entries
+    if (now - lastEntryRef.current < 15_000) return;
 
-    // Kalshi momentum: net move of last 5 candles sets direction
-    // Short-term (last 3) must not be reversing
-    const last5 = candles.slice(-5);
-    const kalshiNet = last5[4].close - last5[0].open;
-    const last3 = candles.slice(-3);
-    const kalshiNet3 = last3[2].close - last3[0].open;
+    // Order flow: use last 5 ticks (~7.5s of data at 1.5s poll)
+    const recent   = flow.slice(-5);
+    const askDelta = recent[4].yes_ask - recent[0].yes_ask; // ask trend
+    const bidDelta = recent[4].yes_bid - recent[0].yes_bid; // bid trend
+    // Volume acceleration — is the market heating up?
+    const volDelta = recent[4].volume - recent[0].volume;
 
+    // Buy pressure: asks and bids both rising (buyers lifting offers, market moving up)
+    // Sell pressure: asks and bids both falling (sellers dumping, market moving down)
     let side = null;
-    if (kalshiNet > 0.8 && kalshiNet3 > -0.3 && yesPrice < 65)  side = "YES";
-    else if (kalshiNet < -0.8 && kalshiNet3 < 0.3 && yesPrice > 35) side = "NO";
+    if (askDelta >= 2 && bidDelta >= 1 && yesPrice < 70)  side = "YES";
+    else if (askDelta <= -2 && bidDelta <= -1 && yesPrice > 30) side = "NO";
 
     if (!side) return;
 
@@ -937,14 +905,14 @@ export default function App() {
     const size      = Math.min(maxBetRef.current * stratMultiplier, Math.max(balanceRef.current * 0.12, 5));
     const contracts = Math.max(1, Math.floor(size / Math.max(yesPrice / 100, 0.01)));
     const id        = now;
-    const netStr    = (kalshiNet >= 0 ? "+" : "") + fmt(Math.abs(kalshiNet), 1) + "¢";
+    const flowStr   = `ask ${askDelta >= 0 ? "+" : ""}${askDelta}¢ bid ${bidDelta >= 0 ? "+" : ""}${bidDelta}¢`;
 
     const trade = {
       id, time: new Date().toLocaleTimeString(), timestamp: id,
       market: market.question?.slice(0, 50),
       side, label: side === "YES" ? "UP ↑" : "DOWN ↓",
       price: fmt(yesPrice), size: fmt(size), contracts,
-      analysis: `Kalshi momentum ${netStr} · YES ${fmt(yesPrice, 1)}¢ · min ${Math.round(timeInWindow / 60)} of 15`,
+      analysis: `Order flow ${flowStr} · vol +${volDelta} · YES ${fmt(yesPrice, 1)}¢`,
       status: "open", pnl: null, evalResult: null, reason: null, holdMs: null,
     };
 
@@ -1303,9 +1271,9 @@ export default function App() {
               const size = parseFloat(openTrade.size);
               const priceDelta = openTrade.side === "YES" ? currentPx - entryPx : entryPx - currentPx;
               const unrealized = priceDelta * (size / Math.max(entryPx, 1));
-              const profitTarget = strat === "aggressive" ? 16 : strat === "recovery" ? 10 : 14; // ¢
-              const stopTarget   = strat === "aggressive" ? 12 : strat === "recovery" ?  7 : 10; // ¢
-              const maxHoldMin = 8; // max 8 min hold
+              const profitTarget = strat === "aggressive" ? 8 : strat === "recovery" ? 4 : 6; // ¢
+              const stopTarget   = strat === "aggressive" ? 6 : strat === "recovery" ? 3 : 4; // ¢
+              const maxHoldMin = 1.5; // max 1.5 min hold
               const progress = Math.min(elapsed / (maxHoldMin * 60), 1);
               const winning = unrealized > 0;
               const accentColor = winning ? "#00c805" : "#ff5000";
@@ -1315,9 +1283,9 @@ export default function App() {
               let thinking;
               if (priceDelta >= profitTarget) thinking = `+${profitTarget}¢ target — taking profit now`;
               else if (priceDelta <= -stopTarget) thinking = `Stop loss triggered at −${stopTarget}¢ — closing`;
-              else if (msToSettle && msToSettle < 2 * 60_000) thinking = "2 min to settlement — exiting now";
-              else if (winning) thinking = `Market repricing toward BTC move — up +${fmt(priceDelta, 1)}¢`;
-              else thinking = "Waiting for Kalshi to reprice vs BTC spot momentum";
+              else if (msToSettle && msToSettle < 90_000) thinking = "1.5 min to settlement — exiting now";
+              else if (winning) thinking = `Order flow continuing — up +${fmt(priceDelta, 1)}¢, targeting +${profitTarget}¢`;
+              else thinking = `Waiting for flow to push price — at ${fmt(priceDelta, 1)}¢, stop at −${stopTarget}¢`;
 
               const stratLabels = { normal: "NORMAL", defensive: "DEFENSIVE 🛡️", recovery: "RECOVERY 🔄", aggressive: "AGGRESSIVE 🚀" };
 
@@ -1717,37 +1685,40 @@ export default function App() {
                 <div style={{ fontWeight: 800, fontSize: "15px", marginBottom: "14px" }}>📋 Entry Conditions</div>
                 {(() => {
                   void tradeTick;
-                  const yp  = liveYesPrice;
+                  const yp   = liveYesPrice;
+                  const flow = orderFlowRef.current;
                   const market = selectedMarket;
                   const endMs = market?.endDate ? new Date(market.endDate).getTime() : null;
                   const now = Date.now();
                   const windowStart = endMs ? endMs - 15 * 60_000 : null;
                   const timeInWindow = windowStart ? (now - windowStart) / 1000 : null;
                   const timeToEnd = endMs ? (endMs - now) / 1000 : null;
-                  const windowOk = timeInWindow !== null && timeInWindow >= 30 && timeInWindow <= 720 && timeToEnd >= 90;
+                  const windowOk = timeInWindow !== null && timeInWindow >= 30 && timeToEnd >= 90;
                   const minuteIn = timeInWindow !== null ? Math.max(0, Math.round(timeInWindow / 60)) : null;
 
-                  const c = candlesRef.current;
-                  const last5 = c.length >= 5 ? c.slice(-5) : null;
-                  const last3 = c.length >= 3 ? c.slice(-3) : null;
-                  const kalshiNet  = last5 ? last5[4].close - last5[0].open : null;
-                  const kalshiNet3 = last3 ? last3[2].close - last3[0].open : null;
-                  const momentumOk = kalshiNet !== null && Math.abs(kalshiNet) > 0.8;
-                  const notReversing = kalshiNet3 !== null && (kalshiNet > 0 ? kalshiNet3 > -0.3 : kalshiNet3 < 0.3);
-                  const pricingOk = yp !== null && ((kalshiNet > 0 && yp < 65) || (kalshiNet < 0 && yp > 35));
+                  const recent   = flow.length >= 5 ? flow.slice(-5) : null;
+                  const askDelta = recent ? recent[4].yes_ask - recent[0].yes_ask : null;
+                  const bidDelta = recent ? recent[4].yes_bid - recent[0].yes_bid : null;
+                  const flowOk   = askDelta !== null && ((askDelta >= 2 && bidDelta >= 1) || (askDelta <= -2 && bidDelta <= -1));
+                  const buyPressure  = askDelta !== null && askDelta >= 2 && bidDelta >= 1;
+                  const sellPressure = askDelta !== null && askDelta <= -2 && bidDelta <= -1;
+                  const pricingOk = yp !== null && ((buyPressure && yp < 70) || (sellPressure && yp > 30));
                   const openCount = tradesRef.current.filter(t => t.status === "open").length;
-                  const slotOk = openCount < 2;
-                  const allGreen = botActive && momentumOk && notReversing && pricingOk && windowOk && slotOk;
+                  const slotOk = openCount < 3;
+                  const allGreen = botActive && flowOk && pricingOk && windowOk && slotOk;
 
                   const dot = (pass, na = false) => na ? { color: "#333", icon: "·" }
                     : pass ? { color: "#00c805", icon: "✓" } : { color: "#ff5000", icon: "✗" };
 
+                  const flowDir = buyPressure ? "BUY" : sellPressure ? "SELL" : "FLAT";
+                  const flowColor = buyPressure ? "#00c805" : sellPressure ? "#ff5000" : "#555";
+
                   const rows = [
-                    { label: "Kalshi 5c momentum",  detail: kalshiNet !== null ? `${kalshiNet >= 0 ? "+" : ""}${fmt(kalshiNet, 1)}¢  (need >0.8¢)` : "awaiting candles", ...dot(momentumOk, kalshiNet === null) },
-                    { label: "3c not reversing",     detail: kalshiNet3 !== null ? `${kalshiNet3 >= 0 ? "+" : ""}${fmt(kalshiNet3, 1)}¢` : "awaiting candles", ...dot(notReversing, kalshiNet3 === null) },
-                    { label: "YES price in range",   detail: yp !== null ? `YES ${fmt(yp, 1)}¢ (need <65 or >35)` : "no price", ...dot(pricingOk, yp === null) },
-                    { label: "Window timing",        detail: timeInWindow !== null ? `min ${minuteIn} of 15 (need 0.5–12, 1.5+ left)` : "no market", ...dot(windowOk, timeInWindow === null) },
-                    { label: "Trade slots open",     detail: `${openCount}/2 open`, ...dot(slotOk) },
+                    { label: "Ask pressure (5 ticks)", detail: askDelta !== null ? `ask ${askDelta >= 0 ? "+" : ""}${askDelta}¢  (need ≥+2 or ≤−2)` : "awaiting feed", ...dot(askDelta !== null && Math.abs(askDelta) >= 2, askDelta === null) },
+                    { label: "Bid pressure (5 ticks)", detail: bidDelta !== null ? `bid ${bidDelta >= 0 ? "+" : ""}${bidDelta}¢  (confirm direction)` : "awaiting feed", ...dot(flowOk, bidDelta === null) },
+                    { label: "YES price in range",     detail: yp !== null ? `YES ${fmt(yp, 1)}¢ (need <70 or >30)` : "no price", ...dot(pricingOk, yp === null) },
+                    { label: "Window timing",          detail: timeInWindow !== null ? `min ${minuteIn} of 15 (1.5+ min left)` : "no market", ...dot(windowOk, timeInWindow === null) },
+                    { label: "Trade slots open",       detail: `${openCount}/3 open`, ...dot(slotOk) },
                   ];
 
                   return (
@@ -1765,9 +1736,10 @@ export default function App() {
                         <div style={{ fontSize: "12px", fontWeight: 800, color: allGreen ? "#00c805" : "#555" }}>
                           {allGreen ? "✓ ALL CONDITIONS MET — ENTERING TRADE" : botActive ? "⏳ WATCHING — waiting for setup" : "⏸ BOT OFF"}
                         </div>
-                        {kalshiNet !== null && (
-                          <div style={{ fontSize: "10px", color: "#444", marginTop: "4px" }}>
-                            Kalshi 5c {kalshiNet >= 0 ? "+" : ""}{fmt(kalshiNet, 1)}¢ · 3c {kalshiNet3 !== null ? (kalshiNet3 >= 0 ? "+" : "") + fmt(kalshiNet3, 1) + "¢" : "—"} · YES {yp ? fmt(yp, 1) + "¢" : "—"}
+                        {askDelta !== null && (
+                          <div style={{ fontSize: "10px", marginTop: "4px" }}>
+                            <span style={{ color: flowColor, fontWeight: 700 }}>{flowDir}</span>
+                            <span style={{ color: "#444" }}> · ask {askDelta >= 0 ? "+" : ""}{askDelta}¢ · bid {bidDelta >= 0 ? "+" : ""}{bidDelta}¢ · YES {yp ? fmt(yp, 1) + "¢" : "—"}</span>
                           </div>
                         )}
                       </div>
