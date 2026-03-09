@@ -711,6 +711,16 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  // ── Auto-switch to next open market when current one expires ─────────────
+  useEffect(() => {
+    const market = selectedMarketRef.current;
+    if (!market?.endDate) return;
+    if (Date.now() < new Date(market.endDate).getTime()) return; // still open
+    const now = Date.now();
+    const next = markets.find(m => m.id !== market.id && (!m.endDate || new Date(m.endDate).getTime() > now));
+    if (next) handleSelectMarket(next);
+  }, [tradeTick, markets]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Adaptive strategy adjuster ────────────────────────────────────────────
   const adjustStrategy = useCallback((newBalance, newWinCount, newTradeCount, newConsecLosses, newConsecWins) => {
     const wr = newTradeCount >= 3 ? newWinCount / newTradeCount : 0.5;
@@ -872,6 +882,8 @@ export default function App() {
   const triggerEntry = useCallback((price, candleBullish, spikeRatio) => {
     if (!entryBotOn || !selectedMarket) return;
     if (spikeRatio < spikeThreshold + 0.1) return;
+    // Block entries if the market window has expired
+    if (selectedMarket.endDate && Date.now() >= new Date(selectedMarket.endDate).getTime()) return;
 
     // Analysis Bot: study price action before committing
     const analysis = analyzePriceAction(candlesRef.current, price);
@@ -1425,15 +1437,37 @@ export default function App() {
                 </div>
 
                 {/* Active market + live price */}
-                {selectedMarket && (
-                  <div style={{ background: "#0d0d0d", borderRadius: "10px", padding: "10px 12px", marginBottom: "10px" }}>
+                {selectedMarket && (() => {
+                  void tradeTick; // refresh countdown every 400ms
+                  const endMs = selectedMarket.endDate ? new Date(selectedMarket.endDate).getTime() : null;
+                  const msLeft = endMs ? endMs - Date.now() : null;
+                  const expired = msLeft !== null && msLeft <= 0;
+                  const countdown = msLeft && msLeft > 0
+                    ? msLeft < 60_000
+                      ? `${Math.ceil(msLeft / 1000)}s left`
+                      : `${Math.floor(msLeft / 60_000)}m ${Math.ceil((msLeft % 60_000) / 1000)}s left`
+                    : null;
+                  return (
+                  <div style={{ background: expired ? "#150000" : "#0d0d0d", borderRadius: "10px", padding: "10px 12px", marginBottom: "10px", border: expired ? "1px solid #ff500033" : "none" }}>
+                    {expired && (
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", padding: "6px 10px", background: "#ff500015", borderRadius: "8px" }}>
+                        <span style={{ fontSize: "13px" }}>🔴</span>
+                        <span style={{ fontSize: "11px", fontWeight: 800, color: "#ff5000", letterSpacing: "0.05em" }}>MARKET CLOSED — switching to next window…</span>
+                      </div>
+                    )}
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
                       <div style={{ fontSize: "11px", color: "#ddd", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedMarket.question}</div>
                       <div style={{ display: "flex", gap: "5px", marginLeft: "8px", flexShrink: 0, alignItems: "center" }}>
-                        {wsStatus === "live"
+                        {expired
+                          ? <span style={{ fontSize: "9px", color: "#ff5000", fontWeight: 700 }}>CLOSED</span>
+                          : countdown
+                            ? <span style={{ fontSize: "9px", color: msLeft < 60_000 ? "#f5a623" : "#555", fontWeight: 700 }}>⏱ {countdown}</span>
+                            : null
+                        }
+                        {!expired && (wsStatus === "live"
                           ? <span style={{ fontSize: "9px", color: "#00c805", fontWeight: 700, display: "flex", alignItems: "center", gap: "3px" }}><span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00c805", display: "inline-block", animation: "pulseGlow 1s infinite" }} />LIVE</span>
                           : <span style={{ fontSize: "9px", color: "#f5a623", fontWeight: 700 }}>{wsStatus === "connecting" ? "⟳ connecting" : "OFFLINE"}</span>
-                        }
+                        )}
                         <Badge color="green">YES {liveYesPrice ? fmt(liveYesPrice, 1) : parseYesPrice(selectedMarket)}¢</Badge>
                         <Badge color="red">NO {liveYesPrice ? fmt(100 - liveYesPrice, 1) : 100 - parseYesPrice(selectedMarket)}¢</Badge>
                       </div>
@@ -1462,7 +1496,8 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                )}
+                  );
+                })()}
 
                 {/* Trade history */}
                 <div style={{ fontSize: "10px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "8px" }}>TRADE HISTORY</div>
