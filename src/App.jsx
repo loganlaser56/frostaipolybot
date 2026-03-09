@@ -483,16 +483,11 @@ export default function App() {
   const [lastFetched, setLastFetched] = useState(null);
   const [marketSearch, setMarketSearch] = useState("");
 
-  // Bot states
-  const [volBotOn, setVolBotOn] = useState(false);
-  const [entryBotOn, setEntryBotOn] = useState(false);
-  const [edgeBotOn, setEdgeBotOn] = useState(false);
+  // Bot state
+  const [botActive, setBotActive] = useState(false);
 
   // Config
-  const [spikeThreshold, setSpikeThreshold] = useState(1.8);
-  const [maxBet, setMaxBet] = useState(200);
-  const [stopLoss, setStopLoss] = useState(15);
-  const [takeProfit, setTakeProfit] = useState(35);
+  const [maxBet, setMaxBet] = useState(50); // default smaller for real-money caution
 
   // Chart data
   const [candles, setCandles] = useState(() => {
@@ -500,12 +495,8 @@ export default function App() {
     for (let i = 0; i < 60; i++) { const c = genCandle(p); arr.push(c); p = c.close; }
     return arr;
   });
-  const [spikes, setSpikes] = useState([]);
   const [entryPrice, setEntryPrice] = useState(null);
   const [tradeMarkers, setTradeMarkers] = useState([]);
-
-  // Bot outputs
-  const [volAlerts, setVolAlerts] = useState([]);
   const [trades, setTrades] = useState([]);
   const [edgeScore, setEdgeScore] = useState(52);
   const [edgeHistory, setEdgeHistory] = useState([52]);
@@ -557,6 +548,9 @@ export default function App() {
   const tradesRef         = useRef([]);
   const closingTradesRef  = useRef(new Set());
   const btcDataRef        = useRef({ price: null, change1m: null, change5m: null, candles: [] });
+  const lastEntryRef      = useRef(0);   // timestamp of last entry (cooldown guard)
+  const maxBetRef         = useRef(50);
+  useEffect(() => { maxBetRef.current = maxBet; }, [maxBet]);
 
   // ── Fetch live markets ────────────────────────────────────────────────────
   const [dataSource, setDataSource] = useState("loading");
@@ -805,47 +799,54 @@ export default function App() {
     }
   }, []);
 
-  // ── Position monitor — runs every 400ms, closes any open trade that hits target ──
-  // Always active regardless of which bots are on. Reads state via refs to avoid
-  // stale closures and does not depend on evaluateEntry or edgeBotOn.
+  // ── Position monitor — price-based exits ─────────────────────────────────
+  // Profit target: +14¢ from entry.  Stop loss: -10¢.
+  // Time stop: 2 min before settlement (don't get caught in last-minute chaos).
   useEffect(() => {
     const openTrades = tradesRef.current.filter(t => t.status === "open");
     if (openTrades.length === 0) return;
 
+    const market  = selectedMarketRef.current;
+    const endTime = market?.endDate ? new Date(market.endDate).getTime() : 0;
+    const msToSettle = endTime - Date.now();
+
     for (const trade of openTrades) {
       if (closingTradesRef.current.has(trade.id)) continue;
 
-      const entryPx = parseFloat(trade.price);
-      const size    = parseFloat(trade.size);
-      const elapsed = Date.now() - trade.timestamp;
-      const strat   = strategyRef.current;
-      const maxHold      = strat === "recovery" ? 4000 : strat === "aggressive" ? 10000 : 7000;
-      const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.10  : 0.05;
+      const entryPx  = parseFloat(trade.price);
+      const size     = parseFloat(trade.size);
+      const elapsed  = Date.now() - trade.timestamp;
+      const strat    = strategyRef.current;
+
+      // Profit/stop targets scale slightly with strategy mode
+      const profitTarget = strat === "aggressive" ? 16 : strat === "recovery" ? 10 : 14; // ¢
+      const stopTarget   = strat === "aggressive" ? 12 : strat === "recovery" ?  7 : 10; // ¢
 
       const currentPx = liveYesPriceRef.current ?? entryPx;
       const rawPnl = (trade.side === "YES" ? currentPx - entryPx : entryPx - currentPx)
         * (size / Math.max(entryPx, 1));
 
-      const inProfit = rawPnl >= profitTarget;
-      const timeout  = elapsed >= maxHold;
+      // Exit conditions
+      const profitHit  = trade.side === "YES" ? currentPx >= entryPx + profitTarget : currentPx <= entryPx - profitTarget;
+      const stopHit    = trade.side === "YES" ? currentPx <= entryPx - stopTarget   : currentPx >= entryPx + stopTarget;
+      const nearSettle = msToSettle > 0 && msToSettle < 2 * 60_000;  // 2 min before end
+      const expired    = endTime > 0 && Date.now() >= endTime;
 
-      if (!inProfit && !timeout) continue;
+      if (!profitHit && !stopHit && !nearSettle && !expired) continue;
 
-      // Mark as being closed immediately to prevent re-entry
       closingTradesRef.current.add(trade.id);
 
       const good = rawPnl > 0;
-      const reason = inProfit && good
-        ? "Profit target reached — closed position"
-        : timeout && good ? "Max hold reached — closed in profit"
-        : timeout        ? "Max hold reached — exited at market"
-        : "Spike faded — cut position";
+      const reason = profitHit    ? `+${profitTarget}¢ target hit — profit taken`
+        : stopHit    ? `−${stopTarget}¢ stop loss — position closed`
+        : nearSettle ? `Settlement in 2 min — exiting ${good ? "in profit" : "at loss"}`
+        :              `Market settled — ${good ? "win" : "loss"}`;
       const suggestion = !good ? [
-        "Tighten entry — only first tick after spike",
-        "Require 2× spike ratio before entering",
-        "Skip spikes where body < 40% of range",
-        "Wait for volume to sustain 2 candles",
-        "Reduce size when spread is wide at spike",
+        "Wait for stronger BTC 5m move (>0.18%) before entering",
+        "Check that Kalshi price is further from 50 — better mispricing = better edge",
+        "Avoid entering after minute 7 of the window",
+        "Confirm BTC 1m not reversing before entry",
+        "Reduce size in recovery mode until win rate improves",
       ][Math.floor(Math.random() * 5)] : null;
 
       // Update internal trade record
@@ -906,158 +907,117 @@ export default function App() {
     }
   }, [tradeTick, adjustStrategy]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Entry — gated by Analysis Bot + volume spike ───────────────────────────
-  const triggerEntry = useCallback((price, candleBullish, spikeRatio) => {
-    if (!entryBotOn || !selectedMarket) return;
-    if (spikeRatio < spikeThreshold + 0.1) return;
-    // Block entries if the market window has expired
-    if (selectedMarket.endDate && Date.now() >= new Date(selectedMarket.endDate).getTime()) return;
+  // ── Evaluate edge on every BTC price update ──────────────────────────────
+  // Strategy: enter when BTC spot has moved meaningfully in one direction
+  // but Kalshi hasn't fully repriced yet. Hold minutes, not seconds.
+  useEffect(() => {
+    if (!botActive) return;
+    if (tradesRef.current.some(t => t.status === "open")) return;
 
-    // Analysis Bot: study price action before committing (Kalshi + BTC spot factors)
-    const analysis = analyzePriceAction(candlesRef.current, price, btcDataRef.current);
-    const desiredSide = candleBullish ? "YES" : "NO";
-    const analysisAgrees = analysis.signal === desiredSide;
-    // Require analysis confirmation unless analysis says WAIT (neutral)
-    if (analysis.signal !== "WAIT" && !analysisAgrees) {
-      setCurrentAnalysis({ ...analysis, blocked: true });
-      return; // analysis disagrees — skip this spike
-    }
-    setCurrentAnalysis({ ...analysis, blocked: false });
+    const market = selectedMarketRef.current;
+    if (!market?.endDate) return;
 
-    const wr = tradeCountRef.current >= 3 ? winCountRef.current / tradeCountRef.current : 0.5;
-    const edgeBonus = clamp((edgeRef.current - 50) / 50, 0, 1);
-    const wrBonus   = clamp((wr - 0.4) / 0.4, 0, 1);
+    const endTime    = new Date(market.endDate).getTime();
+    const now        = Date.now();
+    const windowStart = endTime - 15 * 60_000;
+    const timeInWindow = (now - windowStart) / 1000;   // seconds
+    const timeToEnd    = (endTime - now) / 1000;       // seconds
+
+    // Only trade 1–8 min into the window, with 3+ min left before settlement
+    if (timeInWindow < 60 || timeInWindow > 480 || timeToEnd < 180) return;
+
+    const c5m      = btcDataRef.current?.change5m ?? null;
+    const c1m      = btcDataRef.current?.change1m ?? null;
+    const yesPrice = liveYesPriceRef.current;
+
+    if (yesPrice == null || c5m === null) return;
+
+    // 90-second cooldown between entries — one trade per market window
+    if (now - lastEntryRef.current < 90_000) return;
+
+    // Entry conditions:
+    // YES: BTC moving up (5m > 0.12%) + spot not reversing (1m > -0.05%) + Kalshi underpriced (<57¢)
+    // NO:  BTC moving dn (5m < -0.12%) + spot not reversing (1m < +0.05%) + Kalshi underpriced (>43¢)
+    let side = null;
+    if (c5m > 0.12 && (c1m === null || c1m > -0.05) && yesPrice < 57)  side = "YES";
+    else if (c5m < -0.12 && (c1m === null || c1m < 0.05) && yesPrice > 43) side = "NO";
+
+    if (!side) return;
+
+    lastEntryRef.current = now;
+
     const stratMultiplier = strategyRef.current === "aggressive" ? 1.4
-      : strategyRef.current === "recovery" ? 0.3
-      : strategyRef.current === "defensive" ? 0.5 : 1.0;
-    const size = Math.min(maxBet, Math.max(balanceRef.current * (0.05 + edgeBonus * 0.08 + wrBonus * 0.07) * stratMultiplier, 2));
-    const contracts = Math.max(1, Math.round(size / Math.max(price / 100, 0.01)));
-    const side  = candleBullish ? "YES" : "NO";
-    const label = candleBullish ? "UP ↑" : "DOWN ↓";
-    const id    = Date.now();
+      : strategyRef.current === "recovery" ? 0.35
+      : strategyRef.current === "defensive" ? 0.6 : 1.0;
+    const size      = Math.min(maxBetRef.current * stratMultiplier, Math.max(balanceRef.current * 0.12, 5));
+    const contracts = Math.max(1, Math.floor(size / Math.max(yesPrice / 100, 0.01)));
+    const id        = now;
+    const c5mStr    = (c5m >= 0 ? "+" : "") + c5m.toFixed(3) + "%";
 
     const trade = {
-      id, time: new Date().toLocaleTimeString(), timestamp: Date.now(),
-      market: selectedMarket.question?.slice(0, 50) + "…",
-      side, label,
-      price: fmt(price), size: fmt(size),
-      spikeRatio: fmt(spikeRatio, 2),
-      contracts,
-      analysis: analysis.reason,
+      id, time: new Date().toLocaleTimeString(), timestamp: id,
+      market: market.question?.slice(0, 50),
+      side, label: side === "YES" ? "UP ↑" : "DOWN ↓",
+      price: fmt(yesPrice), size: fmt(size), contracts,
+      analysis: `BTC 5m ${c5mStr} · Kalshi ${fmt(yesPrice, 1)}¢ · min ${Math.round(timeInWindow / 60)} of 15`,
       status: "open", pnl: null, evalResult: null, reason: null, holdMs: null,
     };
 
-    setEntryPrice(price);
+    setEntryPrice(yesPrice);
     setTrades(prev => [trade, ...prev]);
-    setTradeMarkers(prev => [{ id, side, price, pnl: null }, ...prev.slice(0, 14)]);
+    setTradeMarkers(prev => [{ id, side, price: yesPrice, pnl: null }, ...prev.slice(0, 14)]);
     setTradeCount(c => c + 1);
-    // Position monitor (useEffect on tradeTick) handles exit automatically
+    setCurrentAnalysis({ signal: side, confidence: 1, reason: trade.analysis, factors: null });
 
-    // Submit live open order to Kalshi
-    if (creds.current.kalshiKeyId && creds.current.kalshiPrivKey) {
-      const ticker = selectedMarket?.id;
-      if (ticker && !ticker.startsWith("KXBTCD-T")) {
-        placeOrder({
-          ticker, price, size,
-          side: side === "YES" ? "yes" : "no",
-          apiKeyId: creds.current.kalshiKeyId,
-          rsaPrivateKey: creds.current.kalshiPrivKey,
-        }).then(result => {
-          setOrderLog(log => [{
-            id, time: new Date().toLocaleTimeString(),
-            ticker: ticker.slice(0, 20), side,
-            price: fmt(price), size: fmt(size), ...result,
-          }, ...log.slice(0, 49)]);
-        }).catch(err => {
-          setOrderLog(log => [{
-            id, time: new Date().toLocaleTimeString(),
-            ticker: ticker.slice(0, 20), side, price: fmt(price), size: fmt(size),
-            status: "error", message: err?.message || String(err),
-          }, ...log.slice(0, 49)]);
-        });
-      } else {
+    const ticker = market.id;
+    if (ticker && !ticker.startsWith("KXBTCD-T") && creds.current.kalshiKeyId) {
+      placeOrder({
+        ticker, price: yesPrice, size,
+        side: side === "YES" ? "yes" : "no",
+        apiKeyId: creds.current.kalshiKeyId,
+        rsaPrivateKey: creds.current.kalshiPrivKey,
+      }).then(result => {
         setOrderLog(log => [{
-          id, time: new Date().toLocaleTimeString(),
-          ticker: ticker || "N/A", side, price: fmt(price), size: fmt(size),
-          status: "skipped", message: "Static market — no live order",
+          id, time: new Date().toLocaleTimeString(), ticker: ticker.slice(0, 20),
+          side, price: fmt(yesPrice), size: fmt(size), ...result,
         }, ...log.slice(0, 49)]);
-      }
+      }).catch(err => {
+        setOrderLog(log => [{
+          id, time: new Date().toLocaleTimeString(), ticker: ticker.slice(0, 20),
+          side, price: fmt(yesPrice), size: fmt(size),
+          status: "error", message: err?.message || String(err),
+        }, ...log.slice(0, 49)]);
+      });
     }
-  }, [entryBotOn, maxBet, balance, selectedMarket, spikeThreshold]);
+  }, [btcSpot, botActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Volume bot loop — uses REAL Polymarket order book volume when available ──
+  // ── Candle loop — visualization only (no spike detection) ─────────────────
   useEffect(() => {
-    if (!volBotOn) { clearInterval(timerRef.current); return; }
+    if (!botActive) { clearInterval(timerRef.current); return; }
     timerRef.current = setInterval(() => {
       setCandles(prev => {
         const last = prev[prev.length - 1];
-
-        // Use real accumulated volume from live feed, fall back to simulation
         const realVolTicks = liveVolBuffer.current.splice(0);
         const hasRealVol = realVolTicks.length > 0;
-        const realVol = hasRealVol ? realVolTicks.reduce((a, v) => a + v, 0) : 0;
-
-        // Simulated volume as baseline when no real data
-        const baseVol = 80 + Math.random() * 70;
-        const spikeRoll = Math.random();
-        const simVol = spikeRoll < 0.18 ? baseVol * (2 + Math.random() * 2.5) : baseVol;
-
-        // Prefer real volume; blend if partial data
-        const vol = hasRealVol ? Math.max(realVol, 1) : simVol;
-
-        // Build new candle — use real YES price if available, else random walk
         const currentClose = liveYesPrice || last.close;
         const newClose = hasRealVol
-          ? clamp(currentClose + (Math.random() - 0.48) * 0.8, 1, 99) // tight walk around real price
-          : clamp(last.close + (Math.random() - 0.48) * 1.6, 5, 95);
-
-        const newC = {
-          open: last.close,
-          close: newClose,
-          high: Math.max(last.close, newClose) + Math.random() * (hasRealVol ? 0.5 : 1.2),
-          low: Math.min(last.close, newClose) - Math.random() * (hasRealVol ? 0.5 : 1.2),
-          vol,
-          isLive: hasRealVol
-        };
-
-        const updated = [...prev.slice(-99), newC];
-        const idx = updated.length - 1;
-
-        // Rolling 20-candle average (excluding current)
-        const window = updated.slice(Math.max(0, idx - 20), idx);
-        if (window.length >= 5) {
-          const avg = window.reduce((a, c) => a + c.vol, 0) / window.length;
-          const ratio = vol / avg;
-          if (ratio >= spikeThreshold) {
-            const body = Math.abs(newC.close - newC.open);
-            const range = (newC.high - newC.low) || 1;
-            const strongCandle = body / range > 0.2;
-            if (strongCandle) {
-              setSpikes(s => [...s.slice(-9), idx]);
-              setVolAlerts(a => [{
-                id: Date.now(),
-                time: new Date().toLocaleTimeString(),
-                vol: fmt(vol, 1),
-                avg: fmt(avg, 1),
-                ratio: fmt(ratio, 2),
-                price: fmt(newC.close),
-                dir: newC.close >= newC.open ? "UP" : "DOWN",
-                body: fmt(body / range * 100, 0),
-                isLive: hasRealVol
-              }, ...a.slice(0, 29)]);
-              triggerEntry(newC.close, newC.close >= newC.open, ratio);
-            }
-          }
-        }
-        // Update analysis on every candle
-        setCurrentAnalysis(analyzePriceAction(updated, newClose, btcDataRef.current));
-        return updated;
+          ? clamp(currentClose + (Math.random() - 0.48) * 0.6, 1, 99)
+          : clamp(last.close + (Math.random() - 0.48) * 1.4, 5, 95);
+        const vol = hasRealVol
+          ? Math.max(realVolTicks.reduce((a, v) => a + v, 0), 1)
+          : 80 + Math.random() * 70;
+        return [...prev.slice(-99), {
+          open: last.close, close: newClose,
+          high: Math.max(last.close, newClose) + Math.random() * 0.8,
+          low:  Math.min(last.close, newClose) - Math.random() * 0.8,
+          vol, isLive: hasRealVol,
+        }];
       });
-    }, 1200);
+    }, 1500);
     return () => clearInterval(timerRef.current);
-  }, [volBotOn, spikeThreshold, triggerEntry, liveYesPrice]);
+  }, [botActive, liveYesPrice]);
 
-  const anyOn = volBotOn || entryBotOn || edgeBotOn;
+  const anyOn = botActive;
   const winRate = tradeCount > 0 ? Math.round((winCount / tradeCount) * 100) : 0;
   const lastPrice = candles[candles.length - 1]?.close || 50;
   const filteredMarkets = markets.filter(m => !marketSearch || m.question?.toLowerCase().includes(marketSearch.toLowerCase()));
@@ -1323,10 +1283,10 @@ export default function App() {
             {/* ── Trading Config ── */}
             <Card>
               <div style={{ fontSize: "11px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "16px" }}>TRADING CONFIG</div>
-              <Slider label="Max Bet Size" value={maxBet} onChange={setMaxBet} min={10} max={1000} step={10} prefix="$" />
-              <Slider label="Stop Loss" value={stopLoss} onChange={setStopLoss} min={5} max={50} suffix="%" />
-              <Slider label="Take Profit" value={takeProfit} onChange={setTakeProfit} min={10} max={100} suffix="%" />
-              <Slider label="Volume Spike Threshold" value={spikeThreshold} onChange={setSpikeThreshold} min={1.5} max={5} step={0.1} suffix="×" />
+              <Slider label="Max Bet Size" value={maxBet} onChange={setMaxBet} min={5} max={500} step={5} prefix="$" />
+              <div style={{ fontSize: "11px", color: "#555", marginTop: "-8px", marginBottom: "18px", lineHeight: 1.5 }}>
+                Strategy: enter when BTC 5m move &gt;0.12% + Kalshi underpriced. Target +14¢, stop −10¢, max hold 8 min.
+              </div>
             </Card>
 
             {/* ── Risk Warning ── */}
@@ -1351,26 +1311,28 @@ export default function App() {
               const openTrade = trades.find(t => t.status === "open");
               if (!openTrade) return null;
               const now = Date.now();
-              const elapsed = (now - openTrade.timestamp) / 1000;
+              const elapsed = (now - openTrade.timestamp) / 1000; // seconds
               const strat = strategy;
-              const maxHold = strat === "recovery" ? 2.4 : strat === "aggressive" ? 6.0 : 4.8;
-              const progress = Math.min(elapsed / maxHold, 1);
               const entryPx = parseFloat(openTrade.price);
               const currentPx = liveYesPrice || entryPx;
               const size = parseFloat(openTrade.size);
               const priceDelta = openTrade.side === "YES" ? currentPx - entryPx : entryPx - currentPx;
               const unrealized = priceDelta * (size / Math.max(entryPx, 1));
-              const profitTarget = strat === "recovery" ? 0.02 : strat === "aggressive" ? 0.12 : 0.05;
+              const profitTarget = strat === "aggressive" ? 16 : strat === "recovery" ? 10 : 14; // ¢
+              const stopTarget   = strat === "aggressive" ? 12 : strat === "recovery" ?  7 : 10; // ¢
+              const maxHoldMin = 8; // max 8 min hold
+              const progress = Math.min(elapsed / (maxHoldMin * 60), 1);
               const winning = unrealized > 0;
               const accentColor = winning ? "#00c805" : "#ff5000";
+              const endTime = selectedMarket?.endDate ? new Date(selectedMarket.endDate).getTime() : 0;
+              const msToSettle = endTime ? endTime - now : null;
 
               let thinking;
-              if (unrealized > profitTarget) thinking = "Profit target hit — closing position now";
-              else if (progress >= 0.9) thinking = "Max hold time reached — exiting trade";
-              else if (progress > 0.65 && winning) thinking = `Holding profit ${fmtPnl(unrealized)} — watching for exit`;
-              else if (progress > 0.65) thinking = "Past mid-hold, momentum fading — preparing exit";
-              else if (winning) thinking = `Spike follow-through confirmed — riding ${fmtPnl(unrealized)} gain`;
-              else thinking = "Monitoring spike momentum · Waiting for price follow-through";
+              if (priceDelta >= profitTarget) thinking = `+${profitTarget}¢ target — taking profit now`;
+              else if (priceDelta <= -stopTarget) thinking = `Stop loss triggered at −${stopTarget}¢ — closing`;
+              else if (msToSettle && msToSettle < 2 * 60_000) thinking = "2 min to settlement — exiting now";
+              else if (winning) thinking = `Market repricing toward BTC move — up +${fmt(priceDelta, 1)}¢`;
+              else thinking = "Waiting for Kalshi to reprice vs BTC spot momentum";
 
               const stratLabels = { normal: "NORMAL", defensive: "DEFENSIVE 🛡️", recovery: "RECOVERY 🔄", aggressive: "AGGRESSIVE 🚀" };
 
@@ -1395,12 +1357,13 @@ export default function App() {
                         {openTrade.side === "YES" ? "↑ YES — BTC UP" : "↓ NO — BTC DOWN"}
                       </span>
                       <span style={{ fontSize: "11px", color: "#555" }}>
-                        entered {openTrade.price}¢ · ${openTrade.size} · ×{openTrade.spikeRatio} spike · {stratLabels[strat]}
+                        entered {openTrade.price}¢ · ${openTrade.size} · {stratLabels[strat]}
+                        {openTrade.analysis && <span style={{ marginLeft: "6px" }}>· {openTrade.analysis?.slice(0, 30)}</span>}
                       </span>
                     </div>
                     <div style={{ textAlign: "right", flexShrink: 0 }}>
                       <div style={{ fontSize: "24px", fontWeight: 800, color: accentColor, lineHeight: 1 }}>{fmtPnl(unrealized)}</div>
-                      <div style={{ fontSize: "10px", color: "#555", marginTop: "1px" }}>unrealized · {elapsed.toFixed(1)}s</div>
+                      <div style={{ fontSize: "10px", color: "#555", marginTop: "1px" }}>unrealized · {elapsed < 60 ? elapsed.toFixed(0) + "s" : (elapsed/60).toFixed(1) + "m"}</div>
                     </div>
                   </div>
 
@@ -1417,7 +1380,7 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", justifyContent: "space-between", marginTop: "3px" }}>
                       <span style={{ fontSize: "9px", color: "#444" }}>0s</span>
-                      <span style={{ fontSize: "9px", color: progress > 0.85 ? "#f5a623" : "#444" }}>{maxHold}s max hold</span>
+                      <span style={{ fontSize: "9px", color: progress > 0.85 ? "#f5a623" : "#444" }}>{maxHoldMin}m max · target +{profitTarget}¢ · stop −{stopTarget}¢</span>
                     </div>
                   </div>
 
@@ -1439,17 +1402,17 @@ export default function App() {
             <div style={{ display: "grid", gridTemplateColumns: "3fr 2fr", gap: "16px" }}>
 
               {/* Entry Bot — main card */}
-              <Card glow={entryBotOn ? "#4488ff" : undefined}>
+              <Card glow={botActive ? "#00c805" : undefined}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                    <span style={{ fontSize: "18px" }}>🎯</span>
+                    <span style={{ fontSize: "18px" }}>🤖</span>
                     <div>
-                      <div style={{ fontWeight: 800, fontSize: "15px" }}>Entry Bot</div>
-                      <div style={{ fontSize: "11px", color: "#bbb" }}>BTC 5-min · UP ↑ or DOWN ↓</div>
+                      <div style={{ fontWeight: 800, fontSize: "15px" }}>Trading Bot</div>
+                      <div style={{ fontSize: "11px", color: "#bbb" }}>BTC momentum mispricing · 15-min markets</div>
                     </div>
-                    {entryBotOn && <Badge color="blue">Spike-only</Badge>}
+                    {botActive && <Badge color="green">ACTIVE</Badge>}
                   </div>
-
+                  <Toggle value={botActive} onChange={setBotActive} />
                 </div>
 
                 {/* ── BTC Spot Signal Row ── */}
@@ -1764,47 +1727,67 @@ export default function App() {
             {/* ── ROW 2: Volume Bot + Markets side by side ── */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
 
-              {/* Volume Bot */}
-              <Card glow={volBotOn ? "#00c805" : undefined}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                    <span style={{ fontSize: "18px" }}>📊</span>
+              {/* Bot Status */}
+              <Card>
+                <div style={{ fontWeight: 800, fontSize: "15px", marginBottom: "14px" }}>📋 Entry Conditions</div>
+                {(() => {
+                  void tradeTick;
+                  const c5m = btcChange5m;
+                  const c1m = btcChange1m;
+                  const yp  = liveYesPrice;
+                  const market = selectedMarket;
+                  const endMs = market?.endDate ? new Date(market.endDate).getTime() : null;
+                  const now = Date.now();
+                  const windowStart = endMs ? endMs - 15 * 60_000 : null;
+                  const timeInWindow = windowStart ? (now - windowStart) / 1000 : null;
+                  const timeToEnd = endMs ? (endMs - now) / 1000 : null;
+                  const windowOk = timeInWindow !== null && timeInWindow >= 60 && timeInWindow <= 480 && timeToEnd >= 180;
+                  const minuteIn = timeInWindow !== null ? Math.max(0, Math.round(timeInWindow / 60)) : null;
+
+                  const btcUp = c5m !== null && c5m > 0.12;
+                  const btcDn = c5m !== null && c5m < -0.12;
+                  const btcOk = btcUp || btcDn;
+                  const notReversing = c1m === null || (btcUp ? c1m > -0.05 : btcDn ? c1m < 0.05 : true);
+                  const pricingOk = yp !== null && ((btcUp && yp < 57) || (btcDn && yp > 43));
+                  const noOpenTrade = !tradesRef.current.some(t => t.status === "open");
+                  const allGreen = botActive && btcOk && notReversing && pricingOk && windowOk && noOpenTrade;
+
+                  const chgColor = v => v === null ? "#444" : v > 0 ? "#00c805" : v < 0 ? "#ff5000" : "#555";
+                  const dot = (pass, na = false) => na ? { color: "#333", icon: "·" }
+                    : pass ? { color: "#00c805", icon: "✓" } : { color: "#ff5000", icon: "✗" };
+
+                  const rows = [
+                    { label: "BTC 5m momentum",  detail: c5m !== null ? `${c5m >= 0 ? "+" : ""}${c5m.toFixed(3)}%  (need >0.12%)` : "awaiting feed", ...dot(btcOk, c5m === null) },
+                    { label: "1m not reversing",  detail: c1m !== null ? `${c1m >= 0 ? "+" : ""}${c1m.toFixed(3)}%` : "no data", ...dot(notReversing, c1m === null) },
+                    { label: "Kalshi underpriced", detail: yp !== null ? `YES at ${fmt(yp, 1)}¢ (need <57 or >43)` : "no price", ...dot(pricingOk, yp === null) },
+                    { label: "Window timing",      detail: timeInWindow !== null ? `min ${minuteIn} of 15 (need 1–8, 3+ left)` : "no market", ...dot(windowOk, timeInWindow === null) },
+                    { label: "No open position",   detail: noOpenTrade ? "clear" : "already in trade", ...dot(noOpenTrade) },
+                  ];
+
+                  return (
                     <div>
-                      <div style={{ fontWeight: 800, fontSize: "15px" }}>Volume Bot</div>
-                      <div style={{ fontSize: "11px", color: "#bbb" }}>Rolling 20-candle avg · {spikeThreshold}× threshold</div>
-                    </div>
-                  </div>
-
-                </div>
-
-                {/* Volume chart */}
-                <div style={{ background: "#0a0a0a", borderRadius: "10px", padding: "8px 6px 4px", marginBottom: "10px" }}>
-                  <div style={{ fontSize: "9px", color: "#333", fontWeight: 700, letterSpacing: "0.08em", padding: "0 4px 6px" }}>VOLUME · 🟢 = CONFIRMED SPIKE (body {'>'}30% range)</div>
-                  <VolumeChart candles={candles} spikes={spikes} />
-                </div>
-
-                {/* Spike log */}
-                <div style={{ fontSize: "10px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "8px" }}>SPIKE LOG</div>
-                <div style={{ maxHeight: "200px", overflowY: "auto" }}>
-                  {volAlerts.length === 0
-                    ? <div style={{ color: "#444", fontSize: "13px", textAlign: "center", padding: "24px 0" }}>Start bot to detect spikes</div>
-                    : volAlerts.slice(0, 15).map((a, i) => (
-                      <div key={a.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 6px", borderBottom: "1px solid #141414", animation: "slideIn 0.25s ease" }}>
-                        <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span style={{ fontWeight: 800, fontSize: "12px", color: a.dir === "UP" ? "#00c805" : "#ff5000" }}>{a.dir === "UP" ? "↑" : "↓"} ×{a.ratio}{a.isLive && <span style={{ fontSize:"9px", color:"#00c805", marginLeft:"4px" }}>●LIVE</span>}</span>
-                            <span style={{ fontSize: "10px", color: "#bbb" }}>{a.time}</span>
+                      {rows.map((r, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: "1px solid #141414" }}>
+                          <span style={{ fontSize: "12px", fontWeight: 800, color: r.color, width: "14px", textAlign: "center" }}>{r.icon}</span>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: "11px", color: "#ddd", fontWeight: 600 }}>{r.label}</div>
+                            <div style={{ fontSize: "10px", color: "#555", marginTop: "1px" }}>{r.detail}</div>
                           </div>
-                          <div style={{ fontSize: "10px", color: "#666", marginTop: "1px" }}>Vol {a.vol} · Avg {a.avg} · Body {a.body}%</div>
                         </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={{ fontWeight: 700, fontSize: "13px" }}>{a.price}¢</div>
-                          <Badge color={a.dir === "UP" ? "green" : "red"}>{a.dir}</Badge>
+                      ))}
+                      <div style={{ marginTop: "14px", padding: "10px 12px", borderRadius: "10px", background: allGreen ? "#001a00" : "#111", border: `1px solid ${allGreen ? "#00c80544" : "#222"}` }}>
+                        <div style={{ fontSize: "12px", fontWeight: 800, color: allGreen ? "#00c805" : "#555" }}>
+                          {allGreen ? "✓ ALL CONDITIONS MET — ENTERING TRADE" : botActive ? "⏳ WATCHING — waiting for setup" : "⏸ BOT OFF"}
                         </div>
+                        {c5m !== null && (
+                          <div style={{ fontSize: "10px", color: "#444", marginTop: "4px" }}>
+                            BTC 5m {c5m >= 0 ? "+" : ""}{c5m.toFixed(3)}% · 1m {c1m !== null ? (c1m >= 0 ? "+" : "") + c1m.toFixed(3) + "%" : "—"} · YES {yp ? fmt(yp, 1) + "¢" : "—"}
+                          </div>
+                        )}
                       </div>
-                    ))
-                  }
-                </div>
+                    </div>
+                  );
+                })()}
               </Card>
 
               {/* Markets */}
