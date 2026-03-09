@@ -16,20 +16,31 @@ function genCandle(prev) {
 }
 
 // ─── KALSHI API ───────────────────────────────────────────────────────────────
-// Static BTC markets — used as fallback when live Kalshi API is unreachable
-// Prices in cents (50 = 50%). Tickers follow Kalshi naming conventions.
-const STATIC_MARKETS = [
-  { id: "KXBTCD-T1",  asset: "BTC", question: "Bitcoin above $85,000 today?",           yesPrice: 52, noPrice: 48, volume: 412000, openInterest: 148000, endDate: new Date(Date.now() + 1*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T2",  asset: "BTC", question: "Bitcoin above $90,000 this week?",        yesPrice: 38, noPrice: 62, volume: 389000, openInterest: 137000, endDate: new Date(Date.now() + 2*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T3",  asset: "BTC", question: "Bitcoin below $80,000 this week?",        yesPrice: 28, noPrice: 72, volume: 374000, openInterest: 131000, endDate: new Date(Date.now() + 3*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T4",  asset: "BTC", question: "Bitcoin above $88,000 by end of day?",    yesPrice: 44, noPrice: 56, volume: 401000, openInterest: 143000, endDate: new Date(Date.now() + 4*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T5",  asset: "BTC", question: "Bitcoin between $82K–$88K at close?",     yesPrice: 61, noPrice: 39, volume: 356000, openInterest: 124000, endDate: new Date(Date.now() + 5*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T6",  asset: "BTC", question: "Bitcoin above $95,000 this month?",       yesPrice: 22, noPrice: 78, volume: 418000, openInterest: 151000, endDate: new Date(Date.now() + 6*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T7",  asset: "BTC", question: "Bitcoin hits new all-time high this week?",yesPrice: 35, noPrice: 65, volume: 367000, openInterest: 128000, endDate: new Date(Date.now() + 7*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T8",  asset: "BTC", question: "Bitcoin above $87,000 at 4 PM ET today?", yesPrice: 49, noPrice: 51, volume: 392000, openInterest: 139000, endDate: new Date(Date.now() + 8*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T9",  asset: "BTC", question: "Bitcoin drops below $82,000 today?",      yesPrice: 18, noPrice: 82, volume: 408000, openInterest: 145000, endDate: new Date(Date.now() + 9*60*60000).toISOString(), active: true },
-  { id: "KXBTCD-T10", asset: "BTC", question: "Bitcoin closes above $86,000 today?",     yesPrice: 55, noPrice: 45, volume: 381000, openInterest: 134000, endDate: new Date(Date.now() + 10*60*60000).toISOString(), active: true },
-];
+// Static fallback markets — KXBTC15M style (BTC 15-min up/down).
+// Used only when the Netlify function can't reach Kalshi.
+function makeStaticMarkets() {
+  const now = Date.now();
+  // Snap to the next 15-min boundary, then generate 8 upcoming windows
+  const ms15 = 15 * 60 * 1000;
+  const nextBoundary = Math.ceil(now / ms15) * ms15;
+  return Array.from({ length: 8 }, (_, i) => {
+    const end = new Date(nextBoundary + i * ms15);
+    const pad = n => String(n).padStart(2, "0");
+    const ticker = `KXBTCD-T${i + 1}`; // fake — WS skipped for these
+    return {
+      id:           ticker,
+      asset:        "BTC",
+      question:     `Will Bitcoin go UP in the 15 min ending ${pad(end.getHours())}:${pad(end.getMinutes())} ET?`,
+      yesPrice:     50,
+      noPrice:      50,
+      volume:       0,
+      openInterest: 0,
+      endDate:      end.toISOString(),
+      active:       true,
+    };
+  });
+}
+const STATIC_MARKETS = makeStaticMarkets();
 
 // ─── KALSHI LIVE API LAYER ────────────────────────────────────────────────────
 const KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2";
@@ -513,7 +524,7 @@ export default function App() {
     setMarketsError(null);
     try {
       const data = await fetchMarkets(30);
-      const isStatic = data[0] && data[0].id && data[0].id.startsWith("btc-");
+      const isStatic = data[0] && data[0].id && data[0].id.startsWith("KXBTCD-T");
       setDataSource(isStatic ? "static" : "live");
       const seen = new Set();
       const deduped = (Array.isArray(data) ? data : []).filter(m => {
@@ -525,10 +536,13 @@ export default function App() {
       const final = deduped.length > 0 ? deduped : STATIC_MARKETS;
       setMarkets(final);
       setLastFetched(new Date());
-      // Always auto-select the next upcoming candle (first market)
+      // Auto-select the soonest-expiring open market (current active 15-min window)
       if (final.length > 0) {
-        setSelectedMarket(final[0]);
-        const initPrice = parseYesPrice(final[0]);
+        const now = Date.now();
+        const active = final.filter(m => !m.endDate || new Date(m.endDate).getTime() > now);
+        const pick = active[0] || final[0];
+        setSelectedMarket(pick);
+        const initPrice = parseYesPrice(pick);
         const arr = []; let p = initPrice;
         for (let i = 0; i < 60; i++) { const c = genCandle(p); arr.push(c); p = c.close; }
         setCandles(arr);
@@ -547,7 +561,8 @@ export default function App() {
     if (hasFetched.current) return;
     hasFetched.current = true;
     loadMarkets();
-    const t = setInterval(loadMarkets, 30_000);
+    // Refresh every 5 min — new KXBTC15M windows open every 15 min
+    const t = setInterval(loadMarkets, 5 * 60_000);
     return () => clearInterval(t);
   }, []);
 

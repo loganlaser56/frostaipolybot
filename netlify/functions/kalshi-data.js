@@ -18,39 +18,18 @@ export const handler = async (event) => {
   // ── GET MARKETS ─────────────────────────────────────────────────────────────
   if (type === "markets") {
     try {
-      // Try BTC series tickers — Kalshi uses different slugs across products
-      const seriesTickers = ["KXBTC", "BTCUSD", "BTC"];
+      // KXBTC15M = Bitcoin 15-minute up/down series (e.g. KXBTC15M-26MAR091200)
+      const url = `${KALSHI_API}/markets?series_ticker=KXBTC15M&status=open&limit=${limit}`;
+      const resp = await fetch(url, { headers: { "Accept": "application/json" } });
+
       let markets = [];
-
-      for (const series of seriesTickers) {
-        const url = `${KALSHI_API}/markets?series_ticker=${series}&status=open&limit=${limit}`;
-        const resp = await fetch(url, {
-          headers: { "Accept": "application/json" },
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          const list = data.markets || [];
-          if (list.length > 0) {
-            markets = list;
-            break;
-          }
-        }
+      if (resp.ok) {
+        const data = await resp.json();
+        markets = data.markets || [];
       }
 
-      // If series filter returns nothing, fetch all open markets and filter for BTC
-      if (markets.length === 0) {
-        const resp = await fetch(`${KALSHI_API}/markets?status=open&limit=100`, {
-          headers: { "Accept": "application/json" },
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          const all = data.markets || [];
-          markets = all.filter(m => {
-            const t = (m.ticker + " " + (m.title || "") + " " + (m.subtitle || "")).toLowerCase();
-            return t.includes("btc") || t.includes("bitcoin");
-          });
-        }
-      }
+      // Sort by close_time ascending so the soonest-expiring window is first
+      markets.sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
 
       const mapped = markets.map(m => ({
         id:           m.ticker,
