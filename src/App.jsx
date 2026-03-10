@@ -561,6 +561,8 @@ export default function App() {
   }, [markets]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync refs
+  const connectedRef = useRef(false);
+  useEffect(() => { connectedRef.current = connected; }, [connected]);
   useEffect(() => { creds.current = { kalshiKeyId, kalshiPrivKey }; }, [kalshiKeyId, kalshiPrivKey]);
   useEffect(() => { liveYesPriceRef.current = liveYesPrice; }, [liveYesPrice]);
   useEffect(() => { selectedMarketRef.current = selectedMarket; }, [selectedMarket]);
@@ -846,7 +848,8 @@ export default function App() {
 
       // Place real close order on Kalshi
       const ticker = selectedMarketRef.current?.id;
-      if (ticker && !ticker.startsWith("KXBTCD-T") && creds.current.kalshiKeyId) {
+      const canClose = connectedRef.current && creds.current.kalshiKeyId && creds.current.kalshiPrivKey && ticker && !ticker.startsWith("KXBTCD-T");
+      if (canClose) {
         closePosition({
           ticker,
           side: trade.side === "YES" ? "yes" : "no",
@@ -932,7 +935,8 @@ export default function App() {
     setCurrentAnalysis({ signal: side, confidence: 1, reason: trade.analysis, factors: null });
 
     const ticker = market.id;
-    if (ticker && !ticker.startsWith("KXBTCD-T") && creds.current.kalshiKeyId) {
+    const isLive = connectedRef.current && creds.current.kalshiKeyId && creds.current.kalshiPrivKey && !ticker?.startsWith("KXBTCD-T");
+    if (isLive) {
       placeOrder({
         ticker, price: yesPrice, size,
         side: side === "YES" ? "yes" : "no",
@@ -950,6 +954,17 @@ export default function App() {
           status: "error", message: err?.message || String(err),
         }, ...log.slice(0, 49)]);
       });
+    } else {
+      // Paper trade — log reason so user can diagnose
+      const paperReason = !connectedRef.current ? "Not connected — go to Settings → Connect to Kalshi"
+        : !creds.current.kalshiKeyId ? "No API Key ID entered in Settings"
+        : !creds.current.kalshiPrivKey ? "No RSA Private Key entered in Settings"
+        : "Static market (no live ticker) — select a live Kalshi market";
+      setOrderLog(log => [{
+        id, time: new Date().toLocaleTimeString(), ticker: ticker?.slice(0, 20) || "—",
+        side, price: fmt(yesPrice), size: fmt(size),
+        status: "paper", message: paperReason,
+      }, ...log.slice(0, 49)]);
     }
   }, [tradeTick, botActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1207,27 +1222,47 @@ export default function App() {
             </Card>
 
             {/* ── Order log ── */}
-            {orderLog.length > 0 && (
-              <Card>
-                <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "10px" }}>📋 Kalshi Order Log</div>
-                <div style={{ maxHeight: "200px", overflowY: "auto" }}>
-                  {orderLog.map(o => (
-                    <div key={o.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 8px", borderBottom: "1px solid #141414", fontSize: "11px" }}>
-                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                        <span style={{ padding: "2px 7px", borderRadius: "6px", fontSize: "10px", fontWeight: 700,
-                          background: o.status === "filled" ? "#00c80520" : "#ff500020",
-                          color: o.status === "filled" ? "#00c805" : "#ff5000" }}>
-                          {o.status?.toUpperCase()}
-                        </span>
-                        <span style={{ color: o.side === "YES" ? "#00c805" : "#ff5000", fontWeight: 700 }}>{o.side}</span>
-                        <span style={{ color: "#bbb" }}>${o.size} @ {o.price}¢</span>
-                      </div>
-                      <div style={{ color: "#555" }}>{o.time} · {o.ticker || o.tokenId}</div>
-                    </div>
-                  ))}
+            <Card>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                <div style={{ fontWeight: 700, fontSize: "14px" }}>📋 Kalshi Order Log</div>
+                <span style={{ padding: "3px 10px", borderRadius: "100px", fontSize: "10px", fontWeight: 800,
+                  background: connected ? "#00c80520" : "#ff500018",
+                  color: connected ? "#00c805" : "#ff5000",
+                  border: `1px solid ${connected ? "#00c80533" : "#ff500033"}` }}>
+                  {connected ? "🟢 LIVE" : "⚫ PAPER"}
+                </span>
+              </div>
+              {orderLog.length === 0 ? (
+                <div style={{ fontSize: "11px", color: "#444", padding: "10px 0" }}>
+                  {connected ? "No orders yet — bot will log every trade attempt here." : "⚠️ Not connected. Trades are paper only. Go to Settings → Connect to Kalshi to trade live."}
                 </div>
-              </Card>
-            )}
+              ) : (
+                <div style={{ maxHeight: "220px", overflowY: "auto" }}>
+                  {orderLog.map(o => {
+                    const isGood = o.status === "filled" || o.status === "closed";
+                    const isPaper = o.status === "paper";
+                    const isErr = o.status === "error" || o.status === "rejected";
+                    const color = isGood ? "#00c805" : isPaper ? "#888" : "#ff5000";
+                    const bg = isGood ? "#00c80514" : isPaper ? "#88888810" : "#ff500014";
+                    return (
+                      <div key={o.id} style={{ padding: "7px 8px", borderBottom: "1px solid #141414", fontSize: "11px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                            <span style={{ padding: "2px 7px", borderRadius: "6px", fontSize: "10px", fontWeight: 700, background: bg, color }}>{o.status?.toUpperCase()}</span>
+                            <span style={{ color: o.side === "YES" ? "#00c805" : "#ff5000", fontWeight: 700 }}>{o.side}</span>
+                            <span style={{ color: "#bbb" }}>${o.size} @ {o.price}¢</span>
+                          </div>
+                          <div style={{ color: "#555" }}>{o.time}</div>
+                        </div>
+                        {(isPaper || isErr) && o.message && (
+                          <div style={{ fontSize: "10px", color: isPaper ? "#555" : "#ff5000", marginTop: "3px", paddingLeft: "2px" }}>{o.message}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </Card>
 
             {/* ── API Status ── */}
             <Card>
@@ -1247,7 +1282,7 @@ export default function App() {
               <div style={{ fontSize: "11px", color: "#999", fontWeight: 700, letterSpacing: "0.08em", marginBottom: "16px" }}>TRADING CONFIG</div>
               <Slider label="Max Bet Size" value={maxBet} onChange={setMaxBet} min={5} max={500} step={5} prefix="$" />
               <div style={{ fontSize: "11px", color: "#555", marginTop: "-8px", marginBottom: "18px", lineHeight: 1.5 }}>
-                Strategy: enter when BTC 5m move &gt;0.12% + Kalshi underpriced. Target +14¢, stop −10¢, max hold 8 min.
+                Strategy: EMA crossover — enter when fast EMA crosses slow EMA by ≥1¢. Target +4¢, stop −3¢, EMA reverse exit, max hold 1.5 min.
               </div>
             </Card>
 
