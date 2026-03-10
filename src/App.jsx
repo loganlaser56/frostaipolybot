@@ -497,6 +497,8 @@ export default function App() {
   const btcDataRef        = useRef({ price: null, change1m: null, change5m: null, candles: [] });
   const lastEntryRef      = useRef(0);   // timestamp of last entry (cooldown guard)
   const orderFlowRef      = useRef([]);  // rolling buffer of bid/ask ticks for flow detection
+  const fastEmaRef        = useRef(null); // fast EMA of YES mid price (α=0.4, ≈4-tick)
+  const slowEmaRef        = useRef(null); // slow EMA of YES mid price (α=0.15, ≈12-tick)
   const maxBetRef         = useRef(50);
   useEffect(() => { maxBetRef.current = maxBet; }, [maxBet]);
 
@@ -606,6 +608,8 @@ export default function App() {
     setEntryPrice(null);
     liveVolBuffer.current = [];
     orderFlowRef.current = [];
+    fastEmaRef.current = null;
+    slowEmaRef.current = null;
     lastCandleTime.current = Date.now();
 
     // Disconnect previous feed
@@ -639,6 +643,9 @@ export default function App() {
     const onBook = (book) => setOrderBook(book);
     const onTick = (tick) => {
       orderFlowRef.current = [...orderFlowRef.current.slice(-9), tick]; // keep last 10
+      const mid = (tick.yes_bid + tick.yes_ask) / 2;
+      fastEmaRef.current = fastEmaRef.current === null ? mid : 0.4 * mid + 0.6 * fastEmaRef.current;
+      slowEmaRef.current = slowEmaRef.current === null ? mid : 0.15 * mid + 0.85 * slowEmaRef.current;
     };
     const onStatus = (s) => setWsStatus(s);
 
@@ -766,8 +773,8 @@ export default function App() {
       const strat    = strategyRef.current;
 
       // Quick scalp targets — small profit taken fast, tight stop
-      const profitTarget = strat === "aggressive" ? 8 : strat === "recovery" ? 4 : 6; // ¢
-      const stopTarget   = strat === "aggressive" ? 6 : strat === "recovery" ? 3 : 4; // ¢
+      const profitTarget = strat === "aggressive" ? 6 : strat === "recovery" ? 3 : 4; // ¢
+      const stopTarget   = strat === "aggressive" ? 5 : strat === "recovery" ? 2 : 3; // ¢
 
       const currentPx = liveYesPriceRef.current ?? entryPx;
       const rawPnl = (trade.side === "YES" ? currentPx - entryPx : entryPx - currentPx)
@@ -778,22 +785,29 @@ export default function App() {
       const stopHit    = trade.side === "YES" ? currentPx <= entryPx - stopTarget   : currentPx >= entryPx + stopTarget;
       const nearSettle = msToSettle > 0 && msToSettle < 90_000;  // 1.5 min before end
       const expired    = endTime > 0 && Date.now() >= endTime;
+      // EMA reversal — direction has flipped since entry, exit immediately
+      const fast = fastEmaRef.current;
+      const slow = slowEmaRef.current;
+      const emaReversal = fast !== null && slow !== null && (
+        trade.side === "YES" ? fast < slow - 0.5 : fast > slow + 0.5
+      );
 
-      if (!profitHit && !stopHit && !nearSettle && !expired) continue;
+      if (!profitHit && !stopHit && !emaReversal && !nearSettle && !expired) continue;
 
       closingTradesRef.current.add(trade.id);
 
       const good = rawPnl > 0;
       const reason = profitHit    ? `+${profitTarget}¢ target hit — profit taken`
         : stopHit    ? `−${stopTarget}¢ stop loss — position closed`
-        : nearSettle ? `Settlement in 2 min — exiting ${good ? "in profit" : "at loss"}`
+        : emaReversal ? `EMA reversed — direction flipped, exiting ${good ? "in profit" : "at loss"}`
+        : nearSettle ? `Settlement in 1.5 min — exiting ${good ? "in profit" : "at loss"}`
         :              `Market settled — ${good ? "win" : "loss"}`;
       const suggestion = !good ? [
-        "Wait for stronger BTC 5m move (>0.18%) before entering",
-        "Check that Kalshi price is further from 50 — better mispricing = better edge",
-        "Avoid entering after minute 7 of the window",
-        "Confirm BTC 1m not reversing before entry",
+        "EMA spread was weak at entry — wait for spread ≥1.5¢ for stronger signal",
+        "Price was near 50¢ — edge is better away from 50 where repricing room exists",
         "Reduce size in recovery mode until win rate improves",
+        "Consider tighter stops in choppy markets when spread oscillates",
+        "EMA reversal exit fired early — widen emaReversal threshold to -0.8¢",
       ][Math.floor(Math.random() * 5)] : null;
 
       // Update internal trade record
@@ -854,9 +868,10 @@ export default function App() {
     }
   }, [tradeTick, adjustStrategy]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Evaluate edge on every tick — order flow momentum ────────────────────
-  // Read the rolling bid/ask buffer to detect which side other traders are
-  // piling into. Enter when 5 consecutive ticks show coordinated pressure.
+  // ── Evaluate edge on every tick — EMA crossover model ────────────────────
+  // Fast EMA (α=0.4) vs slow EMA (α=0.15) on Kalshi YES mid price.
+  // Enter when fast crosses slow by ≥1¢ — confirming directional momentum.
+  // Exit on reverse cross, profit target, or stop.
   useEffect(() => {
     if (!botActive) return;
     // Allow up to 3 concurrent open trades
@@ -874,26 +889,21 @@ export default function App() {
     // Trade any time in the window with 1.5+ min left
     if (timeInWindow < 30 || timeToEnd < 90) return;
 
-    const flow     = orderFlowRef.current;
+    const fast     = fastEmaRef.current;
+    const slow     = slowEmaRef.current;
     const yesPrice = liveYesPriceRef.current;
 
-    if (yesPrice == null || flow.length < 5) return;
+    if (fast === null || slow === null || yesPrice == null) return;
 
-    // 15-second cooldown between entries
-    if (now - lastEntryRef.current < 15_000) return;
+    // 10-second cooldown between entries
+    if (now - lastEntryRef.current < 10_000) return;
 
-    // Order flow: use last 5 ticks (~7.5s of data at 1.5s poll)
-    const recent   = flow.slice(-5);
-    const askDelta = recent[4].yes_ask - recent[0].yes_ask; // ask trend
-    const bidDelta = recent[4].yes_bid - recent[0].yes_bid; // bid trend
-    // Volume acceleration — is the market heating up?
-    const volDelta = recent[4].volume - recent[0].volume;
+    // EMA spread: positive = fast above slow = uptrend, negative = downtrend
+    const spread = fast - slow;
 
-    // Buy pressure: asks and bids both rising (buyers lifting offers, market moving up)
-    // Sell pressure: asks and bids both falling (sellers dumping, market moving down)
     let side = null;
-    if (askDelta >= 2 && bidDelta >= 1 && yesPrice < 70)  side = "YES";
-    else if (askDelta <= -2 && bidDelta <= -1 && yesPrice > 30) side = "NO";
+    if (spread >= 1.0 && yesPrice < 72)  side = "YES";
+    else if (spread <= -1.0 && yesPrice > 28) side = "NO";
 
     if (!side) return;
 
@@ -905,14 +915,13 @@ export default function App() {
     const size      = Math.min(maxBetRef.current * stratMultiplier, Math.max(balanceRef.current * 0.12, 5));
     const contracts = Math.max(1, Math.floor(size / Math.max(yesPrice / 100, 0.01)));
     const id        = now;
-    const flowStr   = `ask ${askDelta >= 0 ? "+" : ""}${askDelta}¢ bid ${bidDelta >= 0 ? "+" : ""}${bidDelta}¢`;
 
     const trade = {
       id, time: new Date().toLocaleTimeString(), timestamp: id,
       market: market.question?.slice(0, 50),
       side, label: side === "YES" ? "UP ↑" : "DOWN ↓",
       price: fmt(yesPrice), size: fmt(size), contracts,
-      analysis: `Order flow ${flowStr} · vol +${volDelta} · YES ${fmt(yesPrice, 1)}¢`,
+      analysis: `EMA cross: fast ${fmt(fast, 1)}¢ slow ${fmt(slow, 1)}¢ spread ${spread >= 0 ? "+" : ""}${fmt(spread, 1)}¢`,
       status: "open", pnl: null, evalResult: null, reason: null, holdMs: null,
     };
 
@@ -1284,8 +1293,8 @@ export default function App() {
               if (priceDelta >= profitTarget) thinking = `+${profitTarget}¢ target — taking profit now`;
               else if (priceDelta <= -stopTarget) thinking = `Stop loss triggered at −${stopTarget}¢ — closing`;
               else if (msToSettle && msToSettle < 90_000) thinking = "1.5 min to settlement — exiting now";
-              else if (winning) thinking = `Order flow continuing — up +${fmt(priceDelta, 1)}¢, targeting +${profitTarget}¢`;
-              else thinking = `Waiting for flow to push price — at ${fmt(priceDelta, 1)}¢, stop at −${stopTarget}¢`;
+              else if (winning) thinking = `EMA trend holding — up +${fmt(priceDelta, 1)}¢, targeting +${profitTarget}¢`;
+              else thinking = `Holding — at ${fmt(priceDelta, 1)}¢, EMA reversal or stop at −${stopTarget}¢ will exit`;
 
               const stratLabels = { normal: "NORMAL", defensive: "DEFENSIVE 🛡️", recovery: "RECOVERY 🔄", aggressive: "AGGRESSIVE 🚀" };
 
@@ -1686,7 +1695,8 @@ export default function App() {
                 {(() => {
                   void tradeTick;
                   const yp   = liveYesPrice;
-                  const flow = orderFlowRef.current;
+                  const fast = fastEmaRef.current;
+                  const slow = slowEmaRef.current;
                   const market = selectedMarket;
                   const endMs = market?.endDate ? new Date(market.endDate).getTime() : null;
                   const now = Date.now();
@@ -1696,29 +1706,27 @@ export default function App() {
                   const windowOk = timeInWindow !== null && timeInWindow >= 30 && timeToEnd >= 90;
                   const minuteIn = timeInWindow !== null ? Math.max(0, Math.round(timeInWindow / 60)) : null;
 
-                  const recent   = flow.length >= 5 ? flow.slice(-5) : null;
-                  const askDelta = recent ? recent[4].yes_ask - recent[0].yes_ask : null;
-                  const bidDelta = recent ? recent[4].yes_bid - recent[0].yes_bid : null;
-                  const flowOk   = askDelta !== null && ((askDelta >= 2 && bidDelta >= 1) || (askDelta <= -2 && bidDelta <= -1));
-                  const buyPressure  = askDelta !== null && askDelta >= 2 && bidDelta >= 1;
-                  const sellPressure = askDelta !== null && askDelta <= -2 && bidDelta <= -1;
-                  const pricingOk = yp !== null && ((buyPressure && yp < 70) || (sellPressure && yp > 30));
-                  const openCount = tradesRef.current.filter(t => t.status === "open").length;
-                  const slotOk = openCount < 3;
-                  const allGreen = botActive && flowOk && pricingOk && windowOk && slotOk;
+                  const spread     = fast !== null && slow !== null ? fast - slow : null;
+                  const crossedUp  = spread !== null && spread >= 1.0;
+                  const crossedDn  = spread !== null && spread <= -1.0;
+                  const crossOk    = crossedUp || crossedDn;
+                  const pricingOk  = yp !== null && ((crossedUp && yp < 72) || (crossedDn && yp > 28));
+                  const openCount  = tradesRef.current.filter(t => t.status === "open").length;
+                  const slotOk     = openCount < 3;
+                  const allGreen   = botActive && crossOk && pricingOk && windowOk && slotOk;
 
                   const dot = (pass, na = false) => na ? { color: "#333", icon: "·" }
                     : pass ? { color: "#00c805", icon: "✓" } : { color: "#ff5000", icon: "✗" };
 
-                  const flowDir = buyPressure ? "BUY" : sellPressure ? "SELL" : "FLAT";
-                  const flowColor = buyPressure ? "#00c805" : sellPressure ? "#ff5000" : "#555";
+                  const dir      = crossedUp ? "UP" : crossedDn ? "DOWN" : "FLAT";
+                  const dirColor = crossedUp ? "#00c805" : crossedDn ? "#ff5000" : "#555";
 
                   const rows = [
-                    { label: "Ask pressure (5 ticks)", detail: askDelta !== null ? `ask ${askDelta >= 0 ? "+" : ""}${askDelta}¢  (need ≥+2 or ≤−2)` : "awaiting feed", ...dot(askDelta !== null && Math.abs(askDelta) >= 2, askDelta === null) },
-                    { label: "Bid pressure (5 ticks)", detail: bidDelta !== null ? `bid ${bidDelta >= 0 ? "+" : ""}${bidDelta}¢  (confirm direction)` : "awaiting feed", ...dot(flowOk, bidDelta === null) },
-                    { label: "YES price in range",     detail: yp !== null ? `YES ${fmt(yp, 1)}¢ (need <70 or >30)` : "no price", ...dot(pricingOk, yp === null) },
-                    { label: "Window timing",          detail: timeInWindow !== null ? `min ${minuteIn} of 15 (1.5+ min left)` : "no market", ...dot(windowOk, timeInWindow === null) },
-                    { label: "Trade slots open",       detail: `${openCount}/3 open`, ...dot(slotOk) },
+                    { label: "EMA cross (fast vs slow)", detail: spread !== null ? `spread ${spread >= 0 ? "+" : ""}${fmt(spread, 2)}¢  (need ≥+1 or ≤−1)` : "warming up…", ...dot(crossOk, spread === null) },
+                    { label: "Fast EMA",                 detail: fast !== null ? `${fmt(fast, 2)}¢` : "—", ...dot(fast !== null, fast === null) },
+                    { label: "YES price in range",       detail: yp !== null ? `YES ${fmt(yp, 1)}¢ (need <72 or >28)` : "no price", ...dot(pricingOk, yp === null) },
+                    { label: "Window timing",            detail: timeInWindow !== null ? `min ${minuteIn} of 15 (1.5+ min left)` : "no market", ...dot(windowOk, timeInWindow === null) },
+                    { label: "Trade slots open",         detail: `${openCount}/3 open`, ...dot(slotOk) },
                   ];
 
                   return (
@@ -1736,10 +1744,10 @@ export default function App() {
                         <div style={{ fontSize: "12px", fontWeight: 800, color: allGreen ? "#00c805" : "#555" }}>
                           {allGreen ? "✓ ALL CONDITIONS MET — ENTERING TRADE" : botActive ? "⏳ WATCHING — waiting for setup" : "⏸ BOT OFF"}
                         </div>
-                        {askDelta !== null && (
+                        {spread !== null && (
                           <div style={{ fontSize: "10px", marginTop: "4px" }}>
-                            <span style={{ color: flowColor, fontWeight: 700 }}>{flowDir}</span>
-                            <span style={{ color: "#444" }}> · ask {askDelta >= 0 ? "+" : ""}{askDelta}¢ · bid {bidDelta >= 0 ? "+" : ""}{bidDelta}¢ · YES {yp ? fmt(yp, 1) + "¢" : "—"}</span>
+                            <span style={{ color: dirColor, fontWeight: 700 }}>{dir}</span>
+                            <span style={{ color: "#444" }}> · fast {fmt(fast, 2)}¢ · slow {fmt(slow, 2)}¢ · spread {spread >= 0 ? "+" : ""}{fmt(spread, 2)}¢</span>
                           </div>
                         )}
                       </div>
